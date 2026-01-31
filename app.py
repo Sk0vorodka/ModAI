@@ -14,6 +14,7 @@ from prompts import PROMPT_HIKKA_GEN, PROMPT_HIKKA_FIX, PROMPT_EXTERA_GEN, PROMP
 import aiohttp
 import aiosqlite
 from dotenv import load_dotenv
+from aiohttp_socks import ProxyConnector 
 
 from aiogram import Bot, Dispatcher, Router, F, types
 from aiogram.filters import CommandStart, Command
@@ -33,6 +34,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ONLYSQ_KEY_DEFAULT = os.getenv("ONLYSQ_KEY", "openai")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+PROXY_URL = os.getenv("PROXY_URL") 
 
 DB_NAME = "bot_database.db"
 MAX_FILE_SIZE = 1024 * 500
@@ -46,7 +48,8 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-http_session: Optional[aiohttp.ClientSession] = None
+http_session_direct: Optional[aiohttp.ClientSession] = None
+http_session_proxy: Optional[aiohttp.ClientSession] = None
 
 # --- DIFF SYSTEM CONSTANTS ---
 PROMPT_DIFF_ADDON = (
@@ -182,8 +185,17 @@ async def _api_request(sys, user, user_id):
         headers["X-Title"] = "ModAI Bot"
         
     data = {"model": s["model"], "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}], "max_tokens": MAX_TOKENS}
+    
+    # --- ЛОГИКА ВЫБОРА СЕССИИ ---
+    if prov == "onlysq":
+        current_session = http_session_direct
+    else:
+        # Если прокси не задан, используем прямую, чтобы не падало
+        current_session = http_session_proxy if http_session_proxy else http_session_direct
+
     try:
-        async with http_session.post(url, headers=headers, json=data, timeout=300) as resp:
+        # Используем current_session вместо http_session
+        async with current_session.post(url, headers=headers, json=data, timeout=300) as resp:
             if resp.status != 200: 
                 err = await resp.text()
                 return f"ERROR: HTTP {resp.status} - {err[:200]}"
@@ -506,8 +518,21 @@ async def dl_db(c: types.CallbackQuery):
 async def ign(c: types.CallbackQuery): await c.answer()
 
 async def main():
-    global http_session
-    http_session = aiohttp.ClientSession()
+    # Объявляем глобальные переменные
+    global http_session_direct, http_session_proxy
+    
+    # 1. Создаем прямую сессию (для OnlySq)
+    http_session_direct = aiohttp.ClientSession()
+
+    # 2. Создаем сессию с прокси (для остальных)
+    if PROXY_URL:
+        connector = ProxyConnector.from_url(PROXY_URL)
+        http_session_proxy = aiohttp.ClientSession(connector=connector)
+        print(f"Proxy connected: {PROXY_URL}")
+    else:
+        print("WARNING: PROXY_URL not found in .env, using direct connection for all.")
+        http_session_proxy = aiohttp.ClientSession()
+
     await init_db()
     print("Started")
     await bot.delete_webhook(drop_pending_updates=True)
