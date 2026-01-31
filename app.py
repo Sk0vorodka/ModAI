@@ -617,26 +617,43 @@ async def restore_pending_generations():
 async def main():
     global http_session_direct, http_session_proxy
     
+    # --- 1. Создаем сессии ---
     http_session_direct = aiohttp.ClientSession()
 
     if PROXY_URL:
-        # ... (тут ваш код прокси)
+        # Подключаем прокси (SOCKS4/5)
         connector = ProxyConnector.from_url(PROXY_URL)
         http_session_proxy = aiohttp.ClientSession(connector=connector)
         print(f"Proxy connected: {PROXY_URL}")
     else:
-        # ...
+        print("WARNING: PROXY_URL not found, using direct connection.")
         http_session_proxy = aiohttp.ClientSession()
 
-    await init_db()
-    
-    # --- ДОБАВИТЬ ЭТУ СТРОКУ ---
-    await restore_pending_generations()
-    # ---------------------------
-    
-    print("Started")
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    # --- 2. Запускаем бота в блоке try ---
+    try:
+        await init_db()
+        
+        # Если вы уже добавили функцию восстановления задач из прошлого ответа:
+        # await restore_pending_generations() 
+        
+        print("Started")
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot)
+        
+    # --- 3. Этот блок выполнится ВСЕГДА при остановке бота ---
+    finally:
+        print("🛑 Closing sessions...")
+        if http_session_direct:
+            await http_session_direct.close()
+        if http_session_proxy:
+            await http_session_proxy.close()
+        print("✅ Sessions closed.")
+
+if __name__ == "__main__":
+    try: 
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Bot stopped!")
 
 if __name__ == "__main__":
     try: asyncio.run(main())
