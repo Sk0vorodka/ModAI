@@ -2,3 +2,4 @@ aiosqlite
 aiogram
 aiohttp
 dotenv
+aiohttp-socks
