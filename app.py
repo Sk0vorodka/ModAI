@@ -1,5 +1,3 @@
---- START OF FILE app.py ---
-
 import asyncio
 import logging
 import io
