@@ -123,7 +123,24 @@ async def init_db():
         for c in cols:
             try: await db.execute(f"ALTER TABLE users ADD COLUMN {c} TEXT")
             except: pass
+        
         await db.execute("CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, p_type TEXT, prompt TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        
+        # --- НОВАЯ ТАБЛИЦА ДЛЯ ОЧЕРЕДИ ЗАДАЧ ---
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS pending_gens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                chat_id INTEGER,
+                sys_prompt TEXT,
+                user_prompt TEXT,
+                ext TEXT,
+                is_fix INTEGER,
+                original_code TEXT
+            )
+        """)
+        # ---------------------------------------
+        
         await db.commit()
 
 async def get_user_settings(user_id: int):
@@ -141,6 +158,26 @@ async def update_user(user_id, username, **kwargs):
             val = None if v == "RESET" else v
             await db.execute(f"UPDATE users SET {k} = ? WHERE user_id = ?", (val, user_id))
         await db.commit()
+
+async def add_pending_gen(user_id, chat_id, sys, prompt, ext, is_fix, original_code):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "INSERT INTO pending_gens (user_id, chat_id, sys_prompt, user_prompt, ext, is_fix, original_code) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, chat_id, sys, prompt, ext, 1 if is_fix else 0, original_code)
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+async def remove_pending_gen(row_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("DELETE FROM pending_gens WHERE id = ?", (row_id,))
+        await db.commit()
+
+async def get_all_pending_gens():
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM pending_gens") as cursor:
+            return await cursor.fetchall()
 
 # --- UTILS (KEYBOARDS) ---
 
@@ -363,52 +400,82 @@ async def pk(m: Message, state: FSMContext):
 # --- HANDLERS (GENERATION) ---
 
 # In app.py
+async def execute_generation(task_id, user_id, chat_id, sys, prompt, ext, is_fix, original_code, notify_msg_id=None):
+    try:
+        # Если это фикс, добавляем инструкции по DIFF
+        final_prompt = prompt
+        sys_prompt_final = sys
+        if is_fix:
+            sys_prompt_final += PROMPT_DIFF_ADDON
+        
+        # Делаем запрос (логика выбора прокси уже внутри _api_request)
+        res = await _api_request(sys_prompt_final, final_prompt, user_id)
+        
+        if res.startswith("ERROR"):
+            # Сообщаем об ошибке
+            await bot.send_message(chat_id, f"❌ Ошибка генерации: {res}")
+        else:
+            # Применяем патч или берем код
+            if is_fix and original_code:
+                code, note = apply_patch(original_code, res)
+            else:
+                code, note = apply_patch("", res)
+            
+            # Подготовка файла
+            file = BufferedInputFile(code.encode(), filename=f"result.{ext}")
+            kb = [[InlineKeyboardButton(text="➕ Дополнить", callback_data=f"cont:{'mod' if ext=='py' else 'plug'}"), InlineKeyboardButton(text="🔙 Меню", callback_data="cancel")]]
+            
+            safe_note = html.escape(note)
+            caption_with_quote = f"📝 Ченджлог: <blockquote expandable>{safe_note}</blockquote>"
+            
+            # Отправка результата
+            # Используем bot.send_document, так как объекта Message может не быть (при рестарте)
+            if len(caption_with_quote) > 1000:
+                await bot.send_document(chat_id, file, caption="📝 Ченджлог (см. ниже):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+                await bot.send_message(chat_id, caption_with_quote, parse_mode="HTML")
+            else:
+                await bot.send_document(chat_id, file, caption=caption_with_quote, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+            
+            # Удаляем сообщение "Генерирую...", если передали ID
+            if notify_msg_id:
+                await safe_delete(bot, chat_id, notify_msg_id)
+
+    except Exception as e:
+        logger.error(f"Generation failed: {e}")
+        await bot.send_message(chat_id, f"❌ Критическая ошибка при генерации: {e}")
+    finally:
+        # В ЛЮБОМ СЛУЧАЕ удаляем задачу из БД, чтобы она не зациклилась
+        if task_id:
+            await remove_pending_gen(task_id)
 
 async def run_gen(m: Message, state: FSMContext, sys: str, prompt: str, ext: str, is_fix=False):
     await state.set_state(GenStates.generating)
     
-    # Отправляем сообщение "Генерирую..."
+    # 1. Отправляем сообщение "Генерирую..."
     wait = await m.answer("🧠 Генерирую...")
     
-    # Добавляем инструкции по DIFF, если это режим фикса
-    final_prompt = prompt
-    if is_fix:
-        sys += PROMPT_DIFF_ADDON
-        
-    res = await _api_request(sys, final_prompt, m.from_user.id)
+    # 2. Получаем original_code, если есть
+    data = await state.get_data()
+    original_code = data.get("original_code", "")
     
-    if res.startswith("ERROR"): 
-        await wait.edit_text(f"❌ {res}")
-    else:
-        # Получаем старый код (если есть) для применения патча
-        data = await state.get_data()
-        original_code = data.get("original_code", "")
-        
-        # Если это фикс и есть старый код -> пробуем применить патч
-        if is_fix and original_code:
-            code, note = apply_patch(original_code, res)
-        else:
-            # Иначе (генерация с нуля) - передаем пустой оригинал
-            code, note = apply_patch("", res)
-            
-        await state.update_data(original_code=code)
-        
-        file = BufferedInputFile(code.encode(), filename=f"result.{ext}")
-        kb = [[InlineKeyboardButton(text="➕ Дополнить", callback_data=f"cont:{'mod' if ext=='py' else 'plug'}"), InlineKeyboardButton(text="🔙 Меню", callback_data="cancel")]]
-        
-        safe_note = html.escape(note)
-        caption_with_quote = f"📝 Ченджлог: <blockquote expandable>{safe_note}</blockquote>"
-        
-        if len(caption_with_quote) > 1000:
-            await m.reply_document(file, caption="📝 Ченджлог (см. ниже):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-            await m.answer(caption_with_quote, parse_mode="HTML")
-        else:
-            await m.reply_document(file, caption=caption_with_quote, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
-
-        # Удаляем сообщение "Генерирую", так как результат уже отправлен
-        await wait.delete()
-        
-    await state.set_state(None)
+    # 3. Сохраняем задачу в БД
+    task_id = await add_pending_gen(m.from_user.id, m.chat.id, sys, prompt, ext, is_fix, original_code)
+    
+    # 4. Запускаем выполнение в фоне (не блокируя хендлер)
+    asyncio.create_task(
+        execute_generation(
+            task_id, m.from_user.id, m.chat.id, 
+            sys, prompt, ext, is_fix, original_code, 
+            notify_msg_id=wait.message_id
+        )
+    )
+    
+    # Очищаем стейт (или оставляем, как вам удобно, но original_code мы уже сохранили в БД)
+    # Если нужно сохранить original_code в стейте для дальнейших правок "Дополнить", 
+    # то в execute_generation нужно будет придумать, как обновить FSM, но это сложно без объекта стейта.
+    # Проще всего при нажатии "Дополнить" просить скинуть файл заново или сохранять в result.py
+    
+    await state.set_state(None) 
 
 @router.callback_query(F.data == "nav_gen_mod")
 async def n_gm(c: types.CallbackQuery, state: FSMContext):
@@ -517,23 +584,56 @@ async def dl_db(c: types.CallbackQuery):
 @router.callback_query(F.data == "ignore")
 async def ign(c: types.CallbackQuery): await c.answer()
 
+async def restore_pending_generations():
+    tasks = await get_all_pending_gens()
+    if not tasks:
+        return
+    
+    print(f"🔄 Восстановление {len(tasks)} прерванных генераций...")
+    
+    for task in tasks:
+        # task - это строка из БД (Row object)
+        # Уведомляем пользователя, что мы не забыли про него
+        try:
+            await bot.send_message(task['chat_id'], "🔄 Бот был перезагружен. Возобновляю вашу генерацию...")
+        except:
+            pass # Если юзер заблокировал бота, просто работаем дальше
+
+        # Запускаем задачу
+        asyncio.create_task(
+            execute_generation(
+                task_id=task['id'],
+                user_id=task['user_id'],
+                chat_id=task['chat_id'],
+                sys=task['sys_prompt'],
+                prompt=task['user_prompt'],
+                ext=task['ext'],
+                is_fix=bool(task['is_fix']),
+                original_code=task['original_code'],
+                notify_msg_id=None # Старое сообщение "Генерирую" мы уже не найдем/не удалим
+            )
+        )
+
 async def main():
-    # Объявляем глобальные переменные
     global http_session_direct, http_session_proxy
     
-    # 1. Создаем прямую сессию (для OnlySq)
     http_session_direct = aiohttp.ClientSession()
 
-    # 2. Создаем сессию с прокси (для остальных)
     if PROXY_URL:
+        # ... (тут ваш код прокси)
         connector = ProxyConnector.from_url(PROXY_URL)
         http_session_proxy = aiohttp.ClientSession(connector=connector)
         print(f"Proxy connected: {PROXY_URL}")
     else:
-        print("WARNING: PROXY_URL not found in .env, using direct connection for all.")
+        # ...
         http_session_proxy = aiohttp.ClientSession()
 
     await init_db()
+    
+    # --- ДОБАВИТЬ ЭТУ СТРОКУ ---
+    await restore_pending_generations()
+    # ---------------------------
+    
     print("Started")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
