@@ -1,3 +1,5 @@
+--- START OF FILE app.py ---
+
 import asyncio
 import logging
 import io
@@ -6,6 +8,7 @@ import html
 import math
 import difflib
 import os
+import socket # Нужен для настройки резолвера
 from typing import Optional, Dict, List, Any, Tuple
 
 # Убедитесь, что файл prompts.py лежит в той же папке
@@ -13,8 +16,8 @@ from prompts import PROMPT_HIKKA_GEN, PROMPT_HIKKA_FIX, PROMPT_EXTERA_GEN, PROMP
 
 import aiohttp
 import aiosqlite
+from aiohttp.resolver import AsyncResolver # Импортируем резолвер
 from dotenv import load_dotenv
-from aiohttp_socks import ProxyConnector 
 
 from aiogram import Bot, Dispatcher, Router, F, types
 from aiogram.filters import CommandStart, Command
@@ -34,7 +37,9 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ONLYSQ_KEY_DEFAULT = os.getenv("ONLYSQ_KEY", "openai")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-PROXY_URL = os.getenv("PROXY_URL") 
+
+# Вместо PROXY берем DNS IP
+CUSTOM_DNS_IP = os.getenv("CUSTOM_DNS_IP") 
 
 DB_NAME = "bot_database.db"
 MAX_FILE_SIZE = 1024 * 500
@@ -48,8 +53,8 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-http_session_direct: Optional[aiohttp.ClientSession] = None
-http_session_proxy: Optional[aiohttp.ClientSession] = None
+# Оставляем одну сессию, так как DNS применяется к коннектору
+http_session: Optional[aiohttp.ClientSession] = None
 
 # --- DIFF SYSTEM CONSTANTS ---
 PROMPT_DIFF_ADDON = (
@@ -126,7 +131,6 @@ async def init_db():
         
         await db.execute("CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, p_type TEXT, prompt TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)")
         
-        # --- НОВАЯ ТАБЛИЦА ДЛЯ ОЧЕРЕДИ ЗАДАЧ ---
         await db.execute("""
             CREATE TABLE IF NOT EXISTS pending_gens (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,7 +143,6 @@ async def init_db():
                 original_code TEXT
             )
         """)
-        # ---------------------------------------
         
         await db.commit()
 
@@ -223,16 +226,9 @@ async def _api_request(sys, user, user_id):
         
     data = {"model": s["model"], "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}], "max_tokens": MAX_TOKENS}
     
-    # --- ЛОГИКА ВЫБОРА СЕССИИ ---
-    if prov == "onlysq":
-        current_session = http_session_direct
-    else:
-        # Если прокси не задан, используем прямую, чтобы не падало
-        current_session = http_session_proxy if http_session_proxy else http_session_direct
-
+    # --- ИСПОЛЬЗУЕМ ЕДИНУЮ СЕССИЮ С CUSTOM DNS ---
     try:
-        # Используем current_session вместо http_session
-        async with current_session.post(url, headers=headers, json=data, timeout=300) as resp:
+        async with http_session.post(url, headers=headers, json=data, timeout=300) as resp:
             if resp.status != 200: 
                 err = await resp.text()
                 return f"ERROR: HTTP {resp.status} - {err[:200]}"
@@ -244,23 +240,16 @@ async def safe_delete(bot: Bot, chat_id: int, message_id: int):
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
     except Exception:
-        pass # Игнорируем, если сообщение уже удалено
+        pass 
 
 # --- NEW: DIFF APPLY LOGIC ---
 def apply_patch(original_code: str, response_text: str) -> Tuple[str, str]:
-    """
-    Пытается применить SEARCH/REPLACE блоки. 
-    Возвращает (итоговый код, статусное сообщение).
-    """
-    # 1. Сначала чистим <think>
     text = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL | re.IGNORECASE).strip()
     
-    # 2. Проверяем наличие патчей
     patch_pattern = r"<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>>"
     matches = list(re.finditer(patch_pattern, text, re.DOTALL))
     
     if not matches:
-        # Если патчей нет, ищем полный блок кода (старый режим)
         m = re.search(r"```(?:python|plugin)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
         if m:
             code = m.group(1).strip()
@@ -269,16 +258,14 @@ def apply_patch(original_code: str, response_text: str) -> Tuple[str, str]:
         else:
             return text.strip(), "Код получен (без блоков)."
 
-    # 3. Применяем патчи
     new_code = original_code
     applied_count = 0
     errors = []
 
     for match in matches:
-        search_block = match.group(1) # Не стрипим, важны отступы
+        search_block = match.group(1)
         replace_block = match.group(2)
         
-        # Иногда LLM добавляет лишний пробел в конце SEARCH
         if search_block not in new_code:
             search_block_stripped = search_block.rstrip()
             if search_block_stripped in new_code:
@@ -288,8 +275,6 @@ def apply_patch(original_code: str, response_text: str) -> Tuple[str, str]:
             new_code = new_code.replace(search_block, replace_block, 1)
             applied_count += 1
         else:
-            # Попытка мягкого поиска (игнорируя отступы - ОПАСНО для Python, но иногда нужно)
-            # В данном случае лучше записать ошибку, чтобы не сломать код
             errors.append(f"Не найден фрагмент: {search_block[:30]}...")
 
     comment_text = re.sub(patch_pattern, "", text, flags=re.DOTALL).strip()
@@ -399,44 +384,35 @@ async def pk(m: Message, state: FSMContext):
 
 # --- HANDLERS (GENERATION) ---
 
-# In app.py
 async def execute_generation(task_id, user_id, chat_id, sys, prompt, ext, is_fix, original_code, notify_msg_id=None):
     try:
-        # Если это фикс, добавляем инструкции по DIFF
         final_prompt = prompt
         sys_prompt_final = sys
         if is_fix:
             sys_prompt_final += PROMPT_DIFF_ADDON
         
-        # Делаем запрос (логика выбора прокси уже внутри _api_request)
         res = await _api_request(sys_prompt_final, final_prompt, user_id)
         
         if res.startswith("ERROR"):
-            # Сообщаем об ошибке
             await bot.send_message(chat_id, f"❌ Ошибка генерации: {res}")
         else:
-            # Применяем патч или берем код
             if is_fix and original_code:
                 code, note = apply_patch(original_code, res)
             else:
                 code, note = apply_patch("", res)
             
-            # Подготовка файла
             file = BufferedInputFile(code.encode(), filename=f"result.{ext}")
             kb = [[InlineKeyboardButton(text="➕ Дополнить", callback_data=f"cont:{'mod' if ext=='py' else 'plug'}"), InlineKeyboardButton(text="🔙 Меню", callback_data="cancel")]]
             
             safe_note = html.escape(note)
             caption_with_quote = f"📝 Ченджлог: <blockquote expandable>{safe_note}</blockquote>"
             
-            # Отправка результата
-            # Используем bot.send_document, так как объекта Message может не быть (при рестарте)
             if len(caption_with_quote) > 1000:
                 await bot.send_document(chat_id, file, caption="📝 Ченджлог (см. ниже):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
                 await bot.send_message(chat_id, caption_with_quote, parse_mode="HTML")
             else:
                 await bot.send_document(chat_id, file, caption=caption_with_quote, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
             
-            # Удаляем сообщение "Генерирую...", если передали ID
             if notify_msg_id:
                 await safe_delete(bot, chat_id, notify_msg_id)
 
@@ -444,24 +420,18 @@ async def execute_generation(task_id, user_id, chat_id, sys, prompt, ext, is_fix
         logger.error(f"Generation failed: {e}")
         await bot.send_message(chat_id, f"❌ Критическая ошибка при генерации: {e}")
     finally:
-        # В ЛЮБОМ СЛУЧАЕ удаляем задачу из БД, чтобы она не зациклилась
         if task_id:
             await remove_pending_gen(task_id)
 
 async def run_gen(m: Message, state: FSMContext, sys: str, prompt: str, ext: str, is_fix=False):
     await state.set_state(GenStates.generating)
-    
-    # 1. Отправляем сообщение "Генерирую..."
     wait = await m.answer("🧠 Генерирую...")
     
-    # 2. Получаем original_code, если есть
     data = await state.get_data()
     original_code = data.get("original_code", "")
     
-    # 3. Сохраняем задачу в БД
     task_id = await add_pending_gen(m.from_user.id, m.chat.id, sys, prompt, ext, is_fix, original_code)
     
-    # 4. Запускаем выполнение в фоне (не блокируя хендлер)
     asyncio.create_task(
         execute_generation(
             task_id, m.from_user.id, m.chat.id, 
@@ -469,11 +439,6 @@ async def run_gen(m: Message, state: FSMContext, sys: str, prompt: str, ext: str
             notify_msg_id=wait.message_id
         )
     )
-    
-    # Очищаем стейт (или оставляем, как вам удобно, но original_code мы уже сохранили в БД)
-    # Если нужно сохранить original_code в стейте для дальнейших правок "Дополнить", 
-    # то в execute_generation нужно будет придумать, как обновить FSM, но это сложно без объекта стейта.
-    # Проще всего при нажатии "Дополнить" просить скинуть файл заново или сохранять в result.py
     
     await state.set_state(None) 
 
@@ -485,12 +450,9 @@ async def n_gm(c: types.CallbackQuery, state: FSMContext):
 
 @router.message(GenStates.waiting_for_gen_mod)
 async def p_gm(m: Message, state: FSMContext):
-    # Удаляем только предыдущее сообщение бота ("Напиши ТЗ...")
     data = await state.get_data()
     if "last_msg_id" in data:
         await safe_delete(bot, m.chat.id, data["last_msg_id"])
-    
-    # Сообщение пользователя m.text остается в чате
     await run_gen(m, state, PROMPT_HIKKA_GEN, m.text, "py", is_fix=False)
 
 @router.callback_query(F.data == "nav_fix_mod")
@@ -505,7 +467,6 @@ async def p_fmf(m: Message, state: FSMContext):
     c = (await bot.download_file(f.file_path)).read().decode("utf-8", "ignore")
     await state.update_data(original_code=c)
     
-    # Удаляем просьбу "Отправь файл"
     data = await state.get_data()
     if "last_msg_id" in data:
         await safe_delete(bot, m.chat.id, data["last_msg_id"])
@@ -517,12 +478,8 @@ async def p_fmf(m: Message, state: FSMContext):
 @router.message(GenStates.waiting_for_fix_mod_prompt)
 async def p_fmp(m: Message, state: FSMContext):
     d = await state.get_data()
-    
-    # Удаляем вопрос "Что исправить?"
     if "last_msg_id" in d:
         await safe_delete(bot, m.chat.id, d["last_msg_id"])
-    
-    # Сообщение пользователя с просьбой фикса остается
     await run_gen(m, state, PROMPT_HIKKA_FIX, f"CODE:\n{d['original_code']}\nREQ: {m.text}", "py", is_fix=True)
 
 @router.callback_query(F.data == "nav_gen_plug")
@@ -534,10 +491,8 @@ async def n_gp(c: types.CallbackQuery, state: FSMContext):
 @router.message(GenStates.waiting_for_gen_plug)
 async def p_gp(m: Message, state: FSMContext):
     data = await state.get_data()
-    # Удаляем вопрос бота
     if "last_msg_id" in data:
         await safe_delete(bot, m.chat.id, data["last_msg_id"])
-        
     await run_gen(m, state, PROMPT_EXTERA_GEN, m.text, "plugin", is_fix=False)
 
 @router.callback_query(F.data == "nav_fix_plug")
@@ -546,20 +501,25 @@ async def n_fp(c: types.CallbackQuery, state: FSMContext):
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(GenStates.waiting_for_fix_plug_file)
 
-@router.callback_query(F.data == "nav_fix_plug")
-async def n_fp(c: types.CallbackQuery, state: FSMContext):
-    msg = await c.message.edit_text("📂 <b>Отправь файл .plugin:</b>", reply_markup=get_cancel_kb(), parse_mode='HTML')
+@router.message(GenStates.waiting_for_fix_plug_file, F.document)
+async def p_fpf(m: Message, state: FSMContext):
+    f = await bot.get_file(m.document.file_id)
+    c = (await bot.download_file(f.file_path)).read().decode("utf-8", "ignore")
+    await state.update_data(original_code=c)
+    
+    data = await state.get_data()
+    if "last_msg_id" in data:
+        await safe_delete(bot, m.chat.id, data["last_msg_id"])
+    
+    msg = await m.answer("✅ Файл принят. Что исправить?", reply_markup=get_cancel_kb())
     await state.update_data(last_msg_id=msg.message_id)
-    await state.set_state(GenStates.waiting_for_fix_plug_file)
+    await state.set_state(GenStates.waiting_for_fix_plug_prompt)
 
 @router.message(GenStates.waiting_for_fix_plug_prompt)
 async def p_fpp(m: Message, state: FSMContext):
     d = await state.get_data()
-    
-    # Удаляем "Что исправить?"
     if "last_msg_id" in d:
         await safe_delete(bot, m.chat.id, d["last_msg_id"])
-        
     await run_gen(m, state, PROMPT_EXTERA_FIX, f"CODE:\n{d['original_code']}\nREQ: {m.text}", "plugin", is_fix=True)
 
 @router.callback_query(F.data.startswith("cont:"))
@@ -588,66 +548,53 @@ async def restore_pending_generations():
     tasks = await get_all_pending_gens()
     if not tasks:
         return
-    
     print(f"🔄 Восстановление {len(tasks)} прерванных генераций...")
-    
     for task in tasks:
-        # task - это строка из БД (Row object)
-        # Уведомляем пользователя, что мы не забыли про него
         try:
             await bot.send_message(task['chat_id'], "🔄 Бот был перезагружен. Возобновляю вашу генерацию...")
-        except:
-            pass # Если юзер заблокировал бота, просто работаем дальше
-
-        # Запускаем задачу
+        except: pass
         asyncio.create_task(
             execute_generation(
-                task_id=task['id'],
-                user_id=task['user_id'],
-                chat_id=task['chat_id'],
-                sys=task['sys_prompt'],
-                prompt=task['user_prompt'],
-                ext=task['ext'],
-                is_fix=bool(task['is_fix']),
-                original_code=task['original_code'],
-                notify_msg_id=None # Старое сообщение "Генерирую" мы уже не найдем/не удалим
+                task_id=task['id'], user_id=task['user_id'], chat_id=task['chat_id'],
+                sys=task['sys_prompt'], prompt=task['user_prompt'], ext=task['ext'],
+                is_fix=bool(task['is_fix']), original_code=task['original_code'], notify_msg_id=None
             )
         )
 
 async def main():
-    global http_session_direct, http_session_proxy
+    global http_session
     
-    # --- 1. Создаем сессии ---
-    http_session_direct = aiohttp.ClientSession()
-
-    if PROXY_URL:
-        # Подключаем прокси (SOCKS4/5)
-        connector = ProxyConnector.from_url(PROXY_URL)
-        http_session_proxy = aiohttp.ClientSession(connector=connector)
-        print(f"Proxy connected: {PROXY_URL}")
+    # --- 1. Настраиваем коннектор с кастомным DNS ---
+    connector = None
+    if CUSTOM_DNS_IP:
+        try:
+            # Создаем резолвер, который стучится в указанный IP
+            resolver = AsyncResolver(nameservers=[CUSTOM_DNS_IP])
+            # Привязываем резолвер к TCP коннектору
+            # family=socket.AF_INET принуждает использовать IPv4
+            connector = aiohttp.TCPConnector(resolver=resolver, family=socket.AF_INET)
+            print(f"🌐 Using Custom DNS: {CUSTOM_DNS_IP}")
+        except Exception as e:
+            print(f"❌ Failed to set DNS: {e}, using default.")
+            connector = aiohttp.TCPConnector()
     else:
-        print("WARNING: PROXY_URL not found, using direct connection.")
-        http_session_proxy = aiohttp.ClientSession()
+        print("⚠️ DNS not set in .env, using default system DNS.")
+        connector = aiohttp.TCPConnector()
 
-    # --- 2. Запускаем бота в блоке try ---
+    # --- 2. Создаем единую сессию с этим коннектором ---
+    http_session = aiohttp.ClientSession(connector=connector)
+
     try:
         await init_db()
-        
-        # Если вы уже добавили функцию восстановления задач из прошлого ответа:
-        # await restore_pending_generations() 
-        
+        # await restore_pending_generations() # Раскомментируйте, если нужно
         print("Started")
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
-        
-    # --- 3. Этот блок выполнится ВСЕГДА при остановке бота ---
     finally:
-        print("🛑 Closing sessions...")
-        if http_session_direct:
-            await http_session_direct.close()
-        if http_session_proxy:
-            await http_session_proxy.close()
-        print("✅ Sessions closed.")
+        print("🛑 Closing session...")
+        if http_session:
+            await http_session.close()
+        print("✅ Session closed.")
 
 if __name__ == "__main__":
     try: 
