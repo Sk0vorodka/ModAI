@@ -1,0 +1,518 @@
+import asyncio
+import logging
+import io
+import re
+import html
+import math
+import difflib
+import os
+from typing import Optional, Dict, List, Any, Tuple
+
+# Убедитесь, что файл prompts.py лежит в той же папке
+from prompts import PROMPT_HIKKA_GEN, PROMPT_HIKKA_FIX, PROMPT_EXTERA_GEN, PROMPT_EXTERA_FIX
+
+import aiohttp
+import aiosqlite
+from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher, Router, F, types
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    BufferedInputFile,
+    FSInputFile,
+    Message
+)
+
+# --- CONFIG ---
+load_dotenv() 
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ONLYSQ_KEY_DEFAULT = os.getenv("ONLYSQ_KEY", "openai")
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+
+DB_NAME = "bot_database.db"
+MAX_FILE_SIZE = 1024 * 500
+MAX_TOKENS = 20000
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
+
+http_session: Optional[aiohttp.ClientSession] = None
+
+# --- DIFF SYSTEM CONSTANTS ---
+PROMPT_DIFF_ADDON = (
+    "\n\n⚡️ FAST EDIT MODE:\n"
+    "You generally should NOT rewrite the entire file. Only output the changes.\n"
+    "Use this format exactly to replace code blocks:\n"
+    "<<<<<<< SEARCH\n"
+    "    original line 1\n"
+    "    original line 2\n"
+    "=======\n"
+    "    new line 1\n"
+    "    new line 2\n"
+    ">>>>>>>\n"
+    "\n"
+    "Rules:\n"
+    "1. The SEARCH block must match the original code EXACTLY (indentation, spaces).\n"
+    "2. If you need to replace multiple parts, use multiple SEARCH/REPLACE blocks.\n"
+    "3. If the file is small or changes are massive, you MAY output the full file inside ```python ... ```."
+)
+
+# --- MODELS ---
+PROVIDERS_CONFIG = {
+    "onlysq": {
+        "name": "OnlySq", "icon": "🔶", "base_url": "https://api.onlysq.ru/ai/openai",
+        "models": {
+            "grok-3": {"name": "Grok 3", "icon": "🚀", "desc": "Мощная модель от xAI."},
+            "gpt-5": {"name": "GPT-5", "icon": "🤯", "desc": "Next-Gen OpenAI."},
+            "qwen-3-32b": {"name": "Qwen 3", "icon": "💪", "desc": "Мощная модель для кодинга"},
+            "gpt-4o": {"name": "GPT-4o", "icon": "🧠", "desc": "Стабильная классика."},
+            "deepseek-r1": {"name": "Deepseek r1", "icon": "⚡", "desc": "Рассуждающая модель."},
+            "gpt-5.2-chat": {"name": "GPT-5 Chat", "icon": "🤯", "desc": "Latest from OpenAI."},
+            "o3": {"name": "o3", "icon": "🧠", "desc": "Очень умная"},
+            "o4-mini": {"name": "o4 mini", "icon": "🧠", "desc": "Немного умнее чем o3"},
+        }
+    },
+    "gemini": {
+        "name": "Gemini", "icon": "💎", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "models": {
+            "gemini-pro-latest": {"name": "Gemini Pro Latest", "icon": "🌌", "desc": "Последняя модель Pro версии."},
+            "gemini-flash-latest": {"name": "Gemini Flash Latest", "icon": "🌌", "desc": "Последняя модель Flash версии."},
+            "gemini-2.5-pro": {"name": "Gemini 2.5 Pro", "icon": "💎", "desc": "Мощная и точная."},
+            "gemini-2.5-flash": {"name": "Gemini 2.5 Flash", "icon": "⚡", "desc": "Скоростная."},
+            "gemini-2.5-flash-lite": {"name": "Gemini 2.5 Lite", "icon": "🔦", "desc": "Flashlight версия."},
+        }
+    },
+    "openai": {
+        "name": "OpenAI", "icon": "🤖", "base_url": "https://api.openai.com/v1",
+        "models": {
+            "gpt-5": {"name": "GPT-5", "icon": "🤯", "desc": "Новейшая модель."},
+            "gpt-5-turbo": {"name": "GPT-5 Turbo", "icon": "🚀", "desc": "Ускоренная GPT-5."},
+            "gpt-4o": {"name": "GPT-4o", "icon": "🧠", "desc": "Омни-модель."},
+            "gpt-4o-mini": {"name": "GPT-4o Mini", "icon": "⚡", "desc": "Мини."}
+        }
+    },
+    "openrouter": {
+        "name": "OpenRouter", "icon": "🌐", "base_url": "https://openrouter.ai/api/v1",
+        "models": {
+            "tngtech/deepseek-r1t2-chimera:free": {"name": "DeepSeek R1T2 Chimera", "icon": "🆓", "desc": "Бесплатная R1T2."},
+            "nvidia/nemotron-3-nano-30b-a3b:free": {"name": "Nemotron 3 Nano", "icon": "🆓", "desc": "Открытая модель от NVIDIA."},
+            "google/gemma-3-27b-it:free": {"name": "Gemma 3 27B", "icon": "🆓", "desc": "Gemma Free."},
+            "upstage/solar-pro-3:free": {"name": "Solar Pro 3", "icon": "🆓", "desc": "Мощная модель Upstage."},
+        }
+    }
+}
+
+# --- DB ---
+async def init_db():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, model TEXT DEFAULT 'gpt-4o-mini')")
+        cols = ["gemini_key", "openai_key", "openrouter_key", "onlysq_key", "provider"]
+        for c in cols:
+            try: await db.execute(f"ALTER TABLE users ADD COLUMN {c} TEXT")
+            except: pass
+        await db.execute("CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, p_type TEXT, prompt TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        await db.commit()
+
+async def get_user_settings(user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT gemini_key, openai_key, openrouter_key, onlysq_key, model, provider FROM users WHERE user_id = ?", (user_id,)) as c:
+            r = await c.fetchone()
+            if r: return {"gemini_key": r[0], "openai_key": r[1], "openrouter_key": r[2], "onlysq_key": r[3], "model": r[4], "provider": r[5] or "onlysq"}
+            return {"gemini_key": None, "openai_key": None, "openrouter_key": None, "onlysq_key": None, "model": "gpt-4o-mini", "provider": "onlysq"}
+
+async def update_user(user_id, username, **kwargs):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)) as c:
+            if not await c.fetchone(): await db.execute("INSERT INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
+        for k, v in kwargs.items():
+            val = None if v == "RESET" else v
+            await db.execute(f"UPDATE users SET {k} = ? WHERE user_id = ?", (val, user_id))
+        await db.commit()
+
+# --- UTILS (KEYBOARDS) ---
+
+def get_main_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤖 Ген. Модуль", callback_data="nav_gen_mod"), InlineKeyboardButton(text="🛠 Фикс Модуля", callback_data="nav_fix_mod")],
+        [InlineKeyboardButton(text="🧩 Ген. Плагин", callback_data="nav_gen_plug"), InlineKeyboardButton(text="🔧 Фикс Плагина", callback_data="nav_fix_plug")],
+        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="nav_main_settings")]
+    ])
+
+def get_cancel_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Отмена", callback_data="cancel")]
+    ])
+
+# --- LOGIC ---
+class GenStates(StatesGroup):
+    generating = State()
+    waiting_for_key = State()
+    waiting_for_gen_mod = State()
+    waiting_for_fix_mod_file = State()
+    waiting_for_fix_mod_prompt = State()
+    waiting_for_gen_plug = State()
+    waiting_for_fix_plug_file = State()
+    waiting_for_fix_plug_prompt = State()
+
+async def _api_request(sys, user, user_id):
+    s = await get_user_settings(user_id)
+    prov = s["provider"]
+    conf = PROVIDERS_CONFIG[prov]
+    key = s.get(f"{prov}_key") or (os.getenv("ONLYSQ_KEY") if prov == "onlysq" else None)
+    if not key: return "ERROR: Ключ не установлен в настройках."
+    
+    url = conf["base_url"]
+    if not url.endswith("/chat/completions"):
+        if url.endswith("/"): url = url[:-1]
+        url = f"{url}/chat/completions"
+        
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    if prov == "openrouter":
+        headers["HTTP-Referer"] = "https://t.me/AiModuleBot"
+        headers["X-Title"] = "ModAI Bot"
+        
+    data = {"model": s["model"], "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}], "max_tokens": MAX_TOKENS}
+    try:
+        async with http_session.post(url, headers=headers, json=data, timeout=300) as resp:
+            if resp.status != 200: 
+                err = await resp.text()
+                return f"ERROR: HTTP {resp.status} - {err[:200]}"
+            res = await resp.json()
+            return res["choices"][0]["message"]["content"]
+    except Exception as e: return f"ERROR: {e}"
+
+async def safe_delete(bot: Bot, chat_id: int, message_id: int):
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass # Игнорируем, если сообщение уже удалено
+
+# --- NEW: DIFF APPLY LOGIC ---
+def apply_patch(original_code: str, response_text: str) -> Tuple[str, str]:
+    """
+    Пытается применить SEARCH/REPLACE блоки. 
+    Возвращает (итоговый код, статусное сообщение).
+    """
+    # 1. Сначала чистим <think>
+    text = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL | re.IGNORECASE).strip()
+    
+    # 2. Проверяем наличие патчей
+    patch_pattern = r"<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>>"
+    matches = list(re.finditer(patch_pattern, text, re.DOTALL))
+    
+    if not matches:
+        # Если патчей нет, ищем полный блок кода (старый режим)
+        m = re.search(r"```(?:python|plugin)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+        if m:
+            code = m.group(1).strip()
+            comment = re.sub(r"```.*?```", "", text, flags=re.DOTALL).strip()
+            return code, (comment if comment else "Полная перезапись.")
+        else:
+            return text.strip(), "Код получен (без блоков)."
+
+    # 3. Применяем патчи
+    new_code = original_code
+    applied_count = 0
+    errors = []
+
+    for match in matches:
+        search_block = match.group(1) # Не стрипим, важны отступы
+        replace_block = match.group(2)
+        
+        # Иногда LLM добавляет лишний пробел в конце SEARCH
+        if search_block not in new_code:
+            search_block_stripped = search_block.rstrip()
+            if search_block_stripped in new_code:
+                search_block = search_block_stripped
+        
+        if search_block in new_code:
+            new_code = new_code.replace(search_block, replace_block, 1)
+            applied_count += 1
+        else:
+            # Попытка мягкого поиска (игнорируя отступы - ОПАСНО для Python, но иногда нужно)
+            # В данном случае лучше записать ошибку, чтобы не сломать код
+            errors.append(f"Не найден фрагмент: {search_block[:30]}...")
+
+    comment_text = re.sub(patch_pattern, "", text, flags=re.DOTALL).strip()
+    status = f"Применено {applied_count} правок."
+    if errors:
+        status += f" Не найдено: {len(errors)}."
+    
+    return new_code, f"{status}\n\n{comment_text}"
+
+# --- HANDLERS (START & MENU) ---
+
+@router.message(GenStates.generating)
+async def busy(m: Message): pass
+
+@router.message(CommandStart())
+async def start(m: Message, state: FSMContext):
+    await update_user(m.from_user.id, m.from_user.username)
+    await state.clear()
+    await m.answer("👋 <b>AiGen Bot</b>", reply_markup=get_main_kb(), parse_mode='HTML')
+
+@router.callback_query(F.data == "cancel")
+async def cancel(c: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await c.message.edit_text("👋 <b>AiGen Bot</b>", reply_markup=get_main_kb(), parse_mode='HTML')
+    except Exception:
+        await c.message.answer("👋 <b>AiGen Bot</b>", reply_markup=get_main_kb(), parse_mode='HTML')
+    await c.answer()
+
+# --- HANDLERS (SETTINGS) ---
+
+async def show_tab(event, active):
+    user_id = event.from_user.id
+    
+    s = await get_user_settings(user_id)
+    conf = PROVIDERS_CONFIG[active]
+    
+    text = f"🤖 <b>Выбор модели:</b>\n\n{conf['icon']} <b>{conf['name']}:</b>\n"
+    for _, m in conf["models"].items(): 
+        text += f"• {m['name']} — {m['desc']}\n"
+    
+    btns = []
+    row1 = [InlineKeyboardButton(text=f"{PROVIDERS_CONFIG[p]['icon']} {PROVIDERS_CONFIG[p]['name']}", callback_data=f"tab:{p}") for p in ["onlysq", "gemini"]]
+    row2 = [InlineKeyboardButton(text=f"{PROVIDERS_CONFIG[p]['icon']} {PROVIDERS_CONFIG[p]['name']}", callback_data=f"tab:{p}") for p in ["openai", "openrouter"]]
+    btns.extend([row1, row2, [InlineKeyboardButton(text=f"——— {conf['icon']} {conf['name']} ———", callback_data="ignore")]])
+    
+    models_keys = list(conf["models"].keys())
+    for i, mid in enumerate(models_keys):
+        m_data = conf["models"][mid]
+        mark = "✅" if (s["model"] == mid and s["provider"] == active) else m_data["icon"]
+        btns.append([InlineKeyboardButton(text=f"{mark} {m_data['name']}", callback_data=f"sm:{active}:{i}")])
+    
+    btns.append([InlineKeyboardButton(text=f"🔑 Настроить ключ {conf['name']}", callback_data=f"set_key:{active}")])
+    btns.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="cancel")])
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=btns)
+    
+    if isinstance(event, types.Message):
+        await event.answer(text=text, reply_markup=kb, parse_mode='HTML')
+    elif isinstance(event, types.CallbackQuery):
+        try:
+            await event.message.edit_text(text=text, reply_markup=kb, parse_mode='HTML')
+        except Exception:
+            pass 
+        await event.answer()
+
+@router.message(Command("settings"))
+async def settings_command(m: Message):
+    await show_tab(m, "onlysq")
+
+@router.callback_query(F.data == "nav_main_settings")
+async def settings_callback(c: types.CallbackQuery):
+    await show_tab(c, "onlysq")
+
+@router.callback_query(F.data.startswith("tab:"))
+async def tab(c: types.CallbackQuery): 
+    await show_tab(c, c.data.split(":")[1])
+
+@router.callback_query(F.data.startswith("sm:"))
+async def sm(c: types.CallbackQuery):
+    _, p, i = c.data.split(":")
+    try:
+        mid = list(PROVIDERS_CONFIG[p]["models"].keys())[int(i)]
+        await update_user(c.from_user.id, c.from_user.username, model=mid, provider=p)
+        await c.answer(f"Выбрано: {mid}")
+        await show_tab(c, p)
+    except: await c.answer("Ошибка выбора")
+
+@router.callback_query(F.data.startswith("set_key:"))
+async def sk(c: types.CallbackQuery, state: FSMContext):
+    p = c.data.split(":")[1]
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data=f"tab:{p}")]])
+    await c.message.edit_text(f"🔑 Введите ключ для {p} (или reset):", reply_markup=kb)
+    await state.update_data(kp=p)
+    await state.set_state(GenStates.waiting_for_key)
+
+@router.message(GenStates.waiting_for_key)
+async def pk(m: Message, state: FSMContext):
+    p = (await state.get_data())["kp"]
+    key_val = m.text.strip() if m.text.lower() != "reset" else "RESET"
+    args = {f"{p}_key": key_val}
+    await update_user(m.from_user.id, m.from_user.username, **args)
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ Вернуться в настройки", callback_data="nav_main_settings")]])
+    await m.answer("✅ Сохранено.", reply_markup=kb)
+    await state.clear()
+
+# --- HANDLERS (GENERATION) ---
+
+# In app.py
+
+async def run_gen(m: Message, state: FSMContext, sys: str, prompt: str, ext: str, is_fix=False):
+    await state.set_state(GenStates.generating)
+    
+    # Отправляем сообщение "Генерирую..."
+    wait = await m.answer("🧠 Генерирую...")
+    
+    # Добавляем инструкции по DIFF, если это режим фикса
+    final_prompt = prompt
+    if is_fix:
+        sys += PROMPT_DIFF_ADDON
+        
+    res = await _api_request(sys, final_prompt, m.from_user.id)
+    
+    if res.startswith("ERROR"): 
+        await wait.edit_text(f"❌ {res}")
+    else:
+        # Получаем старый код (если есть) для применения патча
+        data = await state.get_data()
+        original_code = data.get("original_code", "")
+        
+        # Если это фикс и есть старый код -> пробуем применить патч
+        if is_fix and original_code:
+            code, note = apply_patch(original_code, res)
+        else:
+            # Иначе (генерация с нуля) - передаем пустой оригинал
+            code, note = apply_patch("", res)
+            
+        await state.update_data(original_code=code)
+        
+        file = BufferedInputFile(code.encode(), filename=f"result.{ext}")
+        kb = [[InlineKeyboardButton(text="➕ Дополнить", callback_data=f"cont:{'mod' if ext=='py' else 'plug'}"), InlineKeyboardButton(text="🔙 Меню", callback_data="cancel")]]
+        
+        safe_note = html.escape(note)
+        caption_with_quote = f"📝 Ченджлог: <blockquote expandable>{safe_note}</blockquote>"
+        
+        if len(caption_with_quote) > 1000:
+            await m.reply_document(file, caption="📝 Ченджлог (см. ниже):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+            await m.answer(caption_with_quote, parse_mode="HTML")
+        else:
+            await m.reply_document(file, caption=caption_with_quote, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+
+        # Удаляем сообщение "Генерирую", так как результат уже отправлен
+        await wait.delete()
+        
+    await state.set_state(None)
+
+@router.callback_query(F.data == "nav_gen_mod")
+async def n_gm(c: types.CallbackQuery, state: FSMContext):
+    msg = await c.message.edit_text("🤖 <b>ТЗ для Hikka:</b>\nНапиши, что должен делать модуль.", reply_markup=get_cancel_kb(), parse_mode='HTML')
+    await state.update_data(last_msg_id=msg.message_id)
+    await state.set_state(GenStates.waiting_for_gen_mod)
+
+@router.message(GenStates.waiting_for_gen_mod)
+async def p_gm(m: Message, state: FSMContext):
+    # Удаляем только предыдущее сообщение бота ("Напиши ТЗ...")
+    data = await state.get_data()
+    if "last_msg_id" in data:
+        await safe_delete(bot, m.chat.id, data["last_msg_id"])
+    
+    # Сообщение пользователя m.text остается в чате
+    await run_gen(m, state, PROMPT_HIKKA_GEN, m.text, "py", is_fix=False)
+
+@router.callback_query(F.data == "nav_fix_mod")
+async def n_fm(c: types.CallbackQuery, state: FSMContext):
+    msg = await c.message.edit_text("📂 <b>Отправь файл .py:</b>", reply_markup=get_cancel_kb(), parse_mode='HTML')
+    await state.update_data(last_msg_id=msg.message_id)
+    await state.set_state(GenStates.waiting_for_fix_mod_file)
+
+@router.message(GenStates.waiting_for_fix_mod_file, F.document)
+async def p_fmf(m: Message, state: FSMContext):
+    f = await bot.get_file(m.document.file_id)
+    c = (await bot.download_file(f.file_path)).read().decode("utf-8", "ignore")
+    await state.update_data(original_code=c)
+    
+    # Удаляем просьбу "Отправь файл"
+    data = await state.get_data()
+    if "last_msg_id" in data:
+        await safe_delete(bot, m.chat.id, data["last_msg_id"])
+        
+    msg = await m.answer("✅ Файл принят. Что исправить?", reply_markup=get_cancel_kb())
+    await state.update_data(last_msg_id=msg.message_id)
+    await state.set_state(GenStates.waiting_for_fix_mod_prompt)
+
+@router.message(GenStates.waiting_for_fix_mod_prompt)
+async def p_fmp(m: Message, state: FSMContext):
+    d = await state.get_data()
+    
+    # Удаляем вопрос "Что исправить?"
+    if "last_msg_id" in d:
+        await safe_delete(bot, m.chat.id, d["last_msg_id"])
+    
+    # Сообщение пользователя с просьбой фикса остается
+    await run_gen(m, state, PROMPT_HIKKA_FIX, f"CODE:\n{d['original_code']}\nREQ: {m.text}", "py", is_fix=True)
+
+@router.callback_query(F.data == "nav_gen_plug")
+async def n_gp(c: types.CallbackQuery, state: FSMContext):
+    msg = await c.message.edit_text("💡 <b>ТЗ для Extera:</b>\nОпиши функционал плагина.", reply_markup=get_cancel_kb(), parse_mode='HTML')
+    await state.update_data(last_msg_id=msg.message_id)
+    await state.set_state(GenStates.waiting_for_gen_plug)
+
+@router.message(GenStates.waiting_for_gen_plug)
+async def p_gp(m: Message, state: FSMContext):
+    data = await state.get_data()
+    # Удаляем вопрос бота
+    if "last_msg_id" in data:
+        await safe_delete(bot, m.chat.id, data["last_msg_id"])
+        
+    await run_gen(m, state, PROMPT_EXTERA_GEN, m.text, "plugin", is_fix=False)
+
+@router.callback_query(F.data == "nav_fix_plug")
+async def n_fp(c: types.CallbackQuery, state: FSMContext):
+    msg = await c.message.edit_text("📂 <b>Отправь файл .plugin:</b>", reply_markup=get_cancel_kb(), parse_mode='HTML')
+    await state.update_data(last_msg_id=msg.message_id)
+    await state.set_state(GenStates.waiting_for_fix_plug_file)
+
+@router.callback_query(F.data == "nav_fix_plug")
+async def n_fp(c: types.CallbackQuery, state: FSMContext):
+    msg = await c.message.edit_text("📂 <b>Отправь файл .plugin:</b>", reply_markup=get_cancel_kb(), parse_mode='HTML')
+    await state.update_data(last_msg_id=msg.message_id)
+    await state.set_state(GenStates.waiting_for_fix_plug_file)
+
+@router.message(GenStates.waiting_for_fix_plug_prompt)
+async def p_fpp(m: Message, state: FSMContext):
+    d = await state.get_data()
+    
+    # Удаляем "Что исправить?"
+    if "last_msg_id" in d:
+        await safe_delete(bot, m.chat.id, d["last_msg_id"])
+        
+    await run_gen(m, state, PROMPT_EXTERA_FIX, f"CODE:\n{d['original_code']}\nREQ: {m.text}", "plugin", is_fix=True)
+
+@router.callback_query(F.data.startswith("cont:"))
+async def cont(c: types.CallbackQuery, state: FSMContext):
+    act = c.data.split(":")[1]
+    await c.message.answer("📝 Что еще изменить?", reply_markup=get_cancel_kb())
+    await state.set_state(GenStates.waiting_for_fix_mod_prompt if act == "mod" else GenStates.waiting_for_fix_plug_prompt)
+
+# --- ADMIN & SYSTEM ---
+@router.message(Command("admin"))
+async def admin(m: Message):
+    if m.from_user.id != ADMIN_ID: return
+    kb = [[InlineKeyboardButton(text="📥 Скачать БД", callback_data="download_db")]]
+    await m.answer("📊 Админ-панель", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@router.callback_query(F.data == "download_db")
+async def dl_db(c: types.CallbackQuery):
+    if c.from_user.id != ADMIN_ID: return
+    await c.message.answer_document(FSInputFile(DB_NAME), caption="📦 Копия базы данных")
+    await c.answer()
+
+@router.callback_query(F.data == "ignore")
+async def ign(c: types.CallbackQuery): await c.answer()
+
+async def main():
+    global http_session
+    http_session = aiohttp.ClientSession()
+    await init_db()
+    print("Started")
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try: asyncio.run(main())
+    except: pass
