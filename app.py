@@ -208,37 +208,61 @@ async def _api_request(sys, user, user_id):
     s = await get_user_settings(user_id)
     prov = s["provider"]
     conf = PROVIDERS_CONFIG[prov]
-    key = s.get(f"{prov}_key") or (os.getenv("ONLYSQ_KEY") if prov == "onlysq" else None)
-    if not key: return "ERROR: Ключ не установлен в настройках."
+    
+    # Получаем строку с ключами
+    key_data = s.get(f"{prov}_key") or (os.getenv("ONLYSQ_KEY") if prov == "onlysq" else None)
+    if not key_data: return "ERROR: Ключ не установлен в настройках."
+    
+    # Разбиваем ключи по новой строке и чистим от пробелов
+    api_keys = [k.strip() for k in key_data.split('\n') if k.strip()]
     
     url = conf["base_url"]
     if not url.endswith("/chat/completions"):
         if url.endswith("/"): url = url[:-1]
         url = f"{url}/chat/completions"
         
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    if prov == "openrouter":
-        headers["HTTP-Referer"] = "https://t.me/AiModuleBot"
-        headers["X-Title"] = "ModAI Bot"
-        
+    # Данные для запроса (body) одинаковые для всех ключей
     data = {"model": s["model"], "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}], "max_tokens": MAX_TOKENS}
     
-    # --- ЛОГИКА ВЫБОРА СЕССИИ ---
+    # Выбор сессии
     if prov == "onlysq":
         current_session = http_session_direct
     else:
-        # Если прокси не задан, используем прямую, чтобы не падало
         current_session = http_session_proxy if http_session_proxy else http_session_direct
 
-    try:
-        # Используем current_session вместо http_session
-        async with current_session.post(url, headers=headers, json=data, timeout=300) as resp:
-            if resp.status != 200: 
+    last_error = ""
+
+    # --- ЦИКЛ ПЕРЕБОРА КЛЮЧЕЙ ---
+    for index, current_key in enumerate(api_keys):
+        headers = {"Authorization": f"Bearer {current_key}", "Content-Type": "application/json"}
+        if prov == "openrouter":
+            headers["HTTP-Referer"] = "https://t.me/AiModuleBot"
+            headers["X-Title"] = "ModAI Bot"
+
+        try:
+            async with current_session.post(url, headers=headers, json=data, timeout=300) as resp:
+                if resp.status == 200: 
+                    # Успех — возвращаем результат
+                    res = await resp.json()
+                    return res["choices"][0]["message"]["content"]
+                
                 err = await resp.text()
+                
+                # Если ошибка связана с лимитами (429) или доступом (401/403), пробуем следующий ключ
+                if resp.status in [429, 401, 403] or "insufficient_quota" in err:
+                    logger.warning(f"Key #{index+1} failed with status {resp.status}. Trying next key...")
+                    last_error = f"Key #{index+1} Err: {resp.status} - {err[:100]}"
+                    continue # Идем к следующему ключу в списке
+                
+                # Если ошибка другая (например 400 Bad Request или 500 Server Error), возвращаем сразу
                 return f"ERROR: HTTP {resp.status} - {err[:200]}"
-            res = await resp.json()
-            return res["choices"][0]["message"]["content"]
-    except Exception as e: return f"ERROR: {e}"
+                
+        except Exception as e:
+            last_error = f"Connection Err: {e}"
+            continue # При ошибке сети тоже пробуем следующий ключ
+
+    # Если цикл закончился и ни один ключ не подошел
+    return f"ERROR: Все ключи ({len(api_keys)} шт.) не сработали. Последняя ошибка: {last_error}"
 
 async def safe_delete(bot: Bot, chat_id: int, message_id: int):
     try:
@@ -389,12 +413,25 @@ async def sk(c: types.CallbackQuery, state: FSMContext):
 @router.message(GenStates.waiting_for_key)
 async def pk(m: Message, state: FSMContext):
     p = (await state.get_data())["kp"]
-    key_val = m.text.strip() if m.text.lower() != "reset" else "RESET"
+    
+    # ЛОГИКА СОХРАНЕНИЯ НЕСКОЛЬКИХ КЛЮЧЕЙ
+    if m.text.lower() == "reset":
+        key_val = "RESET"
+    else:
+        # Разбиваем по строкам, удаляем пустые и пробелы, склеиваем обратно через \n
+        keys = [k.strip() for k in m.text.split('\n') if k.strip()]
+        if not keys:
+            await m.answer("⚠️ Вы не прислали ни одного ключа.")
+            return
+        key_val = "\n".join(keys) # Сохраняем как одну строку с разделителями
+
     args = {f"{p}_key": key_val}
     await update_user(m.from_user.id, m.from_user.username, **args)
     
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ Вернуться в настройки", callback_data="nav_main_settings")]])
-    await m.answer("<a href='tg://emoji?id=5454079785510660283'>5️⃣</a> Сохранено.", reply_markup=kb)
+    
+    count_msg = "Ключ удален." if key_val == "RESET" else f"Сохранено ключей: {len(key_val.split())} шт."
+    await m.answer(f"<a href='tg://emoji?id=5454079785510660283'>5️⃣</a> {count_msg}", reply_markup=kb, parse_mode='HTML')
     await state.clear()
 
 # --- HANDLERS (GENERATION) ---
