@@ -452,7 +452,7 @@ async def run_gen(m: Message, state: FSMContext, sys: str, prompt: str, ext: str
     await state.set_state(GenStates.generating)
     
     # 1. Отправляем сообщение "Генерирую..."
-    wait = await m.answer("🧠 Генерирую...")
+    wait = await m.answer("<a href='tg://emoji?id=5258281774198311547'>5️⃣</a> Генерирую...")
     
     # 2. Получаем original_code, если есть
     data = await state.get_data()
