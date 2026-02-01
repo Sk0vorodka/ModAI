@@ -573,7 +573,7 @@ async def p_fmf(m: Message, state: FSMContext):
     if "last_msg_id" in data:
         await safe_delete(bot, m.chat.id, data["last_msg_id"])
         
-    msg = await m.answer("<a href='tg://emoji?id=5465542769755826716'>✅</a> Файл принят. Что исправить?", reply_markup=get_cancel_kb())
+    msg = await m.answer("<a href='tg://emoji?id=5465542769755826716'>✅</a> Файл принят. Что исправить?", reply_markup=get_cancel_kb(), parse_mode='HTML')
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(GenStates.waiting_for_fix_mod_prompt)
 
