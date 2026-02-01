@@ -308,15 +308,15 @@ async def busy(m: Message): pass
 async def start(m: Message, state: FSMContext):
     await update_user(m.from_user.id, m.from_user.username)
     await state.clear()
-    await m.answer("👋 <b>AiGen Bot</b>", reply_markup=get_main_kb(), parse_mode='HTML')
+    await m.answer("<a href='tg://emoji?id=5222108309795908493'>5️⃣</a> <b>AiGen Bot</b>", reply_markup=get_main_kb(), parse_mode='HTML')
 
 @router.callback_query(F.data == "cancel")
 async def cancel(c: types.CallbackQuery, state: FSMContext):
     await state.clear()
     try:
-        await c.message.edit_text("👋 <b>AiGen Bot</b>", reply_markup=get_main_kb(), parse_mode='HTML')
+        await c.message.edit_text("<a href='tg://emoji?id=5222108309795908493'>5️⃣</a> <b>AiGen Bot</b>", reply_markup=get_main_kb(), parse_mode='HTML')
     except Exception:
-        await c.message.answer("👋 <b>AiGen Bot</b>", reply_markup=get_main_kb(), parse_mode='HTML')
+        await c.message.answer("<a href='tg://emoji?id=5222108309795908493'>5️⃣</a> <b>AiGen Bot</b>", reply_markup=get_main_kb(), parse_mode='HTML')
     await c.answer()
 
 # --- HANDLERS (SETTINGS) ---
@@ -327,7 +327,7 @@ async def show_tab(event, active):
     s = await get_user_settings(user_id)
     conf = PROVIDERS_CONFIG[active]
     
-    text = f"🤖 <b>Выбор модели:</b>\n\n{conf['icon']} <b>{conf['name']}:</b>\n"
+    text = f"<a href='tg://emoji?id=5301096984617166561'>5️⃣</a> <b>Выбор модели:</b>\n\n{conf['icon']} <b>{conf['name']}:</b>\n"
     for _, m in conf["models"].items(): 
         text += f"• {m['name']} — {m['desc']}\n"
     
@@ -382,7 +382,7 @@ async def sm(c: types.CallbackQuery):
 async def sk(c: types.CallbackQuery, state: FSMContext):
     p = c.data.split(":")[1]
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data=f"tab:{p}")]])
-    await c.message.edit_text(f"🔑 Введите ключ для {p} (или reset):", reply_markup=kb)
+    await c.message.edit_text(f"<a href='tg://emoji?id=5454386656628991407'>5️⃣</a> Введите ключ для {p} (или reset):", reply_markup=kb)
     await state.update_data(kp=p)
     await state.set_state(GenStates.waiting_for_key)
 
@@ -394,7 +394,7 @@ async def pk(m: Message, state: FSMContext):
     await update_user(m.from_user.id, m.from_user.username, **args)
     
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ Вернуться в настройки", callback_data="nav_main_settings")]])
-    await m.answer("✅ Сохранено.", reply_markup=kb)
+    await m.answer("<a href='tg://emoji?id=5454079785510660283'>5️⃣</a> Сохранено.", reply_markup=kb)
     await state.clear()
 
 # --- HANDLERS (GENERATION) ---
@@ -479,7 +479,7 @@ async def run_gen(m: Message, state: FSMContext, sys: str, prompt: str, ext: str
 
 @router.callback_query(F.data == "nav_gen_mod")
 async def n_gm(c: types.CallbackQuery, state: FSMContext):
-    msg = await c.message.edit_text("🤖 <b>ТЗ для Hikka:</b>\nНапиши, что должен делать модуль.", reply_markup=get_cancel_kb(), parse_mode='HTML')
+    msg = await c.message.edit_text("<a href='tg://emoji?id=5314413943035278948'>5️⃣</a> <b>ТЗ для Heroku:</b>\nНапиши, что должен делать модуль.", reply_markup=get_cancel_kb(), parse_mode='HTML')
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(GenStates.waiting_for_gen_mod)
 
@@ -510,7 +510,7 @@ async def p_fmf(m: Message, state: FSMContext):
     if "last_msg_id" in data:
         await safe_delete(bot, m.chat.id, data["last_msg_id"])
         
-    msg = await m.answer("✅ Файл принят. Что исправить?", reply_markup=get_cancel_kb())
+    msg = await m.answer("<a href='tg://emoji?id=5465542769755826716'>5️⃣</a> Файл принят. Что исправить?", reply_markup=get_cancel_kb())
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(GenStates.waiting_for_fix_mod_prompt)
 
@@ -527,7 +527,7 @@ async def p_fmp(m: Message, state: FSMContext):
 
 @router.callback_query(F.data == "nav_gen_plug")
 async def n_gp(c: types.CallbackQuery, state: FSMContext):
-    msg = await c.message.edit_text("💡 <b>ТЗ для Extera:</b>\nОпиши функционал плагина.", reply_markup=get_cancel_kb(), parse_mode='HTML')
+    msg = await c.message.edit_text("<a href='tg://emoji?id=5364174510708764528'>5️⃣</a> <b>ТЗ для Extera:</b>\nОпиши функционал плагина.", reply_markup=get_cancel_kb(), parse_mode='HTML')
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(GenStates.waiting_for_gen_plug)
 
@@ -542,15 +542,19 @@ async def p_gp(m: Message, state: FSMContext):
 
 @router.callback_query(F.data == "nav_fix_plug")
 async def n_fp(c: types.CallbackQuery, state: FSMContext):
-    msg = await c.message.edit_text("📂 <b>Отправь файл .plugin:</b>", reply_markup=get_cancel_kb(), parse_mode='HTML')
+    msg = await c.message.edit_text("<a href='tg://emoji?id=5454419255430767770'>5️⃣</a> <b>Отправь файл .plugin:</b>", reply_markup=get_cancel_kb(), parse_mode='HTML')
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(GenStates.waiting_for_fix_plug_file)
 
-@router.callback_query(F.data == "nav_fix_plug")
-async def n_fp(c: types.CallbackQuery, state: FSMContext):
-    msg = await c.message.edit_text("📂 <b>Отправь файл .plugin:</b>", reply_markup=get_cancel_kb(), parse_mode='HTML')
-    await state.update_data(last_msg_id=msg.message_id)
-    await state.set_state(GenStates.waiting_for_fix_plug_file)
+@router.message(GenStates.waiting_for_fix_plug_file, F.document)
+async def handle_plugin_file(message: types.Message, state: FSMContext):
+    # Проверка расширения файла
+    if message.document.file_name.endswith(".plugin"):
+        # Твоя логика обработки файла
+        await message.answer("<a href='tg://emoji?id=5219899949281453881'>5️⃣</a> Файл получен")
+        await state.clear()
+    else:
+        await message.answer("<a href='tg://emoji?id=5454225015534805938'>5️⃣</a> Это не .plugin файл. Попробуй еще раз.")
 
 @router.message(GenStates.waiting_for_fix_plug_prompt)
 async def p_fpp(m: Message, state: FSMContext):
