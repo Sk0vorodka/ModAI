@@ -584,14 +584,25 @@ async def n_fp(c: types.CallbackQuery, state: FSMContext):
     await state.set_state(GenStates.waiting_for_fix_plug_file)
 
 @router.message(GenStates.waiting_for_fix_plug_file, F.document)
-async def handle_plugin_file(message: types.Message, state: FSMContext):
+async def handle_plugin_file(m: Message, state: FSMContext):
     # Проверка расширения файла
-    if message.document.file_name.endswith(".plugin"):
-        # Твоя логика обработки файла
-        await message.answer("<a href='tg://emoji?id=5219899949281453881'>5️⃣</a> Файл получен")
-        await state.clear()
-    else:
-        await message.answer("<a href='tg://emoji?id=5454225015534805938'>5️⃣</a> Это не .plugin файл. Попробуй еще раз.")
+    if not m.document.file_name.endswith(".plugin"):
+        await m.answer("<a href='tg://emoji?id=5454225015534805938'>5️⃣</a> Это не .plugin файл. Попробуй еще раз.", parse_mode='HTML')
+        return
+
+    # Скачивание файла и сохранение кода в стейт
+    f = await bot.get_file(m.document.file_id)
+    c = (await bot.download_file(f.file_path)).read().decode("utf-8", "ignore")
+    await state.update_data(original_code=c)
+    
+    # Удаляем просьбу "Отправь файл"
+    data = await state.get_data()
+    if "last_msg_id" in data:
+        await safe_delete(bot, m.chat.id, data["last_msg_id"])
+        
+    msg = await m.answer("<a href='tg://emoji?id=5465542769755826716'>5️⃣</a> Файл плагина принят. Что исправить?", reply_markup=get_cancel_kb(), parse_mode='HTML')
+    await state.update_data(last_msg_id=msg.message_id)
+    await state.set_state(GenStates.waiting_for_fix_plug_prompt)
 
 @router.message(GenStates.waiting_for_fix_plug_prompt)
 async def p_fpp(m: Message, state: FSMContext):
