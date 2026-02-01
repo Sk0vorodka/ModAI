@@ -153,7 +153,7 @@ self.db.set("users_list", users)
 ПРИМЕР ИДЕАЛЬНОГО МОДУЛЯ (REFERENCE):
 code
 Python
-# meta developer: @YourTelegramUsername
+# meta developer: @AiModuleBot
 # scope: hikka_only
 # scope: hikka_min 1.3.0
 # requires: aiohttp
@@ -585,7 +585,7 @@ self.db.set("users_list", users)
 ПРИМЕР ИДЕАЛЬНОГО МОДУЛЯ (REFERENCE):
 code
 Python
-# meta developer: @YourTelegramUsername
+# meta developer: @AiModuleBot
 # scope: hikka_only
 # scope: hikka_min 1.3.0
 # requires: aiohttp
@@ -902,7 +902,7 @@ Here's the most basic plugin template:
 __id__ = "weather"
 __name__ = "Weather"
 __description__ = "Provides current weather information [.wt]"
-__author__ = "Your Name"
+__author__ = "@AiModuleBot"
 __version__ = "1.0.0"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.12.0"
@@ -1041,7 +1041,7 @@ from typing import Any
 __id__ = "weather"
 __name__ = "Weather"
 __description__ = "Provides current weather information [.wt]"
-__author__ = "exteraDev"
+__author__ = "@AiModuleBot"
 __version__ = "1.0.0"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.12.0"
@@ -1172,7 +1172,7 @@ from ui.alert import AlertDialogBuilder
 __id__ = "weather_v2"
 __name__ = "Weather (Async)"
 __description__ = "Provides current weather information asynchronously [.wt]"
-__author__ = "exteraDev"
+__author__ = "@AiModuleBot"
 __version__ = "1.1.0"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.12.0"
@@ -1331,14 +1331,14 @@ __name__ = "Better Previews"
 __description__ = "Modifies specific URLs (Twitter, TikTok, Reddit, Instagram, Pixiv) for better previews"
 __version__ = "1.0.0"
 __id__ = "better_previews"
-__author__ = "@immat0x1"
+__author__ = "@AiModuleBot"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.12.0"
 Required fields: __id__ and __name__. The engine also validates __min_version__ if it's present.
 
 __id__: Must be 2-32 characters long, start with a letter, and contain only latin letters, numbers, dashes (-) and underscores (_).
 
-__author__: Supports plain text names or Telegram usernames/channel links (e.g., @yourUsername or @yourPluginChannel). These may be displayed as clickable links in the UI.
+__author__: Supports plain text names or Telegram usernames/channel links (e.g., @AiModuleBot). These may be displayed as clickable links in the UI.
 
 __description__: Supports basic markdown for formatting.
 
@@ -4261,7 +4261,7 @@ __name__ = "Мой Первый Плагин"
 __description__ = "Плагин, который приветствует мир."
 __id__ = "my_first_plugin"
 __version__ = "1.0"
-__author__ = "@MyUsername"
+__author__ = "@AiModuleBot"
 
 # ... импорты ...
 
@@ -5761,11 +5761,12 @@ sPluginIDE/43 - Запрещённый контент [18+]
 sPluginIDE/44 - Робот
 sPluginIDE/45 - Иконка стикера
 sPluginIDE/46 - Предупреждение    
-    The name of the module is in English only."""
+    The name of the module is in English only.
+    Use imports: from cactuslib import CactusUtils, command, uri, HookResult, HookStrategy"""
     "⚠️ RESPONSE FORMAT:\n"
     "1. Write a USER-FRIENDLY changelog in Russian. Explain WHAT features were added for the user (e.g., 'Добавил команду .kick для исключения...', NOT 'Added function def kick').\n"
     "2. Write the code INSIDE a ```python ... ``` block.\n\n"
-    
+    "НЕ ИСПОЛЬЗУЙ  CACTUSLIB!"    
 )
 
 # Аналогично для фикса Extera
@@ -5801,7 +5802,7 @@ Here's the most basic plugin template:
 __id__ = "weather"
 __name__ = "Weather"
 __description__ = "Provides current weather information [.wt]"
-__author__ = "Your Name"
+__author__ = "@AiModuleBot"
 __version__ = "1.0.0"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.12.0"
@@ -5940,7 +5941,7 @@ from typing import Any
 __id__ = "weather"
 __name__ = "Weather"
 __description__ = "Provides current weather information [.wt]"
-__author__ = "exteraDev"
+__author__ = "@AiModuleBot"
 __version__ = "1.0.0"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.12.0"
@@ -6071,7 +6072,7 @@ from ui.alert import AlertDialogBuilder
 __id__ = "weather_v2"
 __name__ = "Weather (Async)"
 __description__ = "Provides current weather information asynchronously [.wt]"
-__author__ = "exteraDev"
+__author__ = "@AiModuleBot"
 __version__ = "1.1.0"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.12.0"
@@ -6230,14 +6231,14 @@ __name__ = "Better Previews"
 __description__ = "Modifies specific URLs (Twitter, TikTok, Reddit, Instagram, Pixiv) for better previews"
 __version__ = "1.0.0"
 __id__ = "better_previews"
-__author__ = "@immat0x1"
+__author__ = "@AiModuleBot"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.12.0"
 Required fields: __id__ and __name__. The engine also validates __min_version__ if it's present.
 
 __id__: Must be 2-32 characters long, start with a letter, and contain only latin letters, numbers, dashes (-) and underscores (_).
 
-__author__: Supports plain text names or Telegram usernames/channel links (e.g., @yourUsername or @yourPluginChannel). These may be displayed as clickable links in the UI.
+__author__: Supports plain text names or Telegram usernames/channel links (e.g., @AiModuleBot). These may be displayed as clickable links in the UI.
 
 __description__: Supports basic markdown for formatting.
 
@@ -9160,7 +9161,7 @@ __name__ = "Мой Первый Плагин"
 __description__ = "Плагин, который приветствует мир."
 __id__ = "my_first_plugin"
 __version__ = "1.0"
-__author__ = "@MyUsername"
+__author__ = "@AiModuleBot"
 
 # ... импорты ...
 
@@ -10662,4 +10663,5 @@ sPluginIDE/45 - Иконка стикера
 sPluginIDE/46 - Предупреждение """   
 "⚠️ RESPONSE FORMAT:\n"
     "1. Write a USER-FRIENDLY changelog in Russian. Explain WHAT features were added for the user (e.g., 'Добавил команду .kick для исключения...', NOT 'Added function def kick').\n"
-    "2. Write the code INSIDE a ```python ... ``` block.\n\n")
+    "2. Write the code INSIDE a ```python ... ``` block.\n\n"
+    "DONT USE CACTUSLIB!")
