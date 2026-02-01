@@ -128,7 +128,6 @@ async def init_db():
         
         await db.execute("CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, p_type TEXT, prompt TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)")
         
-        # --- НОВАЯ ТАБЛИЦА ДЛЯ ОЧЕРЕДИ ЗАДАЧ ---
         await db.execute("""
             CREATE TABLE IF NOT EXISTS pending_gens (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,7 +140,6 @@ async def init_db():
                 original_code TEXT
             )
         """)
-        # ---------------------------------------
         
         await db.commit()
 
@@ -209,13 +207,21 @@ class GenStates(StatesGroup):
 async def _api_request(sys, user, user_id):
     s = await get_user_settings(user_id)
     prov = s["provider"]
-    conf = PROVIDERS_CONFIG[prov]
+    conf = PROVIDERS_CONFIG.get(prov, PROVIDERS_CONFIG["onlysq"])
     
-    # Получаем строку с ключами
-    key_data = s.get(f"{prov}_key") or (os.getenv("ONLYSQ_KEY") if prov == "onlysq" else None)
-    if not key_data: return "ERROR: Ключ не установлен в настройках."
+    # 1. Получаем строку с ключами (приоритет: БД пользователя -> ENV переменная)
+    user_keys = s.get(f"{prov}_key")
+    if user_keys and len(user_keys.strip()) > 5:
+         # Если в базе есть ключи - используем их
+        key_data = user_keys
+    else:
+        # Иначе пробуем дефолтный ключ (только для OnlySQ)
+        key_data = os.getenv("ONLYSQ_KEY") if prov == "onlysq" else None
+
+    if not key_data: 
+        return f"ERROR: Ключи для провайдера '{prov}' не установлены в настройках, а дефолтный ключ отсутствует."
     
-    # Разбиваем ключи по новой строке и чистим от пробелов
+    # 2. Разбиваем ключи (учитываем любые разделители для надежности)
     api_keys = [k.strip() for k in key_data.split('\n') if k.strip()]
     
     url = conf["base_url"]
@@ -223,7 +229,6 @@ async def _api_request(sys, user, user_id):
         if url.endswith("/"): url = url[:-1]
         url = f"{url}/chat/completions"
         
-    # Данные для запроса (body) одинаковые для всех ключей
     data = {"model": s["model"], "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}], "max_tokens": MAX_TOKENS}
     
     # Выбор сессии
@@ -233,7 +238,8 @@ async def _api_request(sys, user, user_id):
         current_session = http_session_proxy if http_session_proxy else http_session_direct
 
     last_error = ""
-
+    success = False
+    
     # --- ЦИКЛ ПЕРЕБОРА КЛЮЧЕЙ ---
     for index, current_key in enumerate(api_keys):
         headers = {"Authorization": f"Bearer {current_key}", "Content-Type": "application/json"}
@@ -244,66 +250,52 @@ async def _api_request(sys, user, user_id):
         try:
             async with current_session.post(url, headers=headers, json=data, timeout=300) as resp:
                 if resp.status == 200: 
-                    # Успех — возвращаем результат
                     res = await resp.json()
                     return res["choices"][0]["message"]["content"]
                 
                 err = await resp.text()
                 
-                # Если ошибка связана с лимитами (429) или доступом (401/403), пробуем следующий ключ
-                if resp.status in [429, 401, 403] or "insufficient_quota" in err:
-                    logger.warning(f"Key #{index+1} failed with status {resp.status}. Trying next key...")
-                    last_error = f"Key #{index+1} Err: {resp.status} - {err[:100]}"
-                    continue # Идем к следующему ключу в списке
+                # Логируем ошибку, но пробуем следующий ключ
+                last_error = f"Key #{index+1} ({prov}) Err: {resp.status} - {err[:100]}"
+                logger.warning(last_error)
+
+                # Если ошибка фатальная (400 - Bad Request, 404 - Not Found), нет смысла перебирать ключи
+                if resp.status in [400, 404]:
+                    return f"ERROR: Критическая ошибка API ({resp.status}): {err[:200]}"
                 
-                # Если ошибка другая (например 400 Bad Request или 500 Server Error), возвращаем сразу
-                return f"ERROR: HTTP {resp.status} - {err[:200]}"
+                # Для 429 (лимиты), 401 (плохой ключ), 403 (бан/доступ) -> идем дальше
+                continue 
                 
         except Exception as e:
             last_error = f"Connection Err: {e}"
-            continue # При ошибке сети тоже пробуем следующий ключ
+            continue 
 
-    # Если цикл закончился и ни один ключ не подошел
-    return f"ERROR: Все ключи ({len(api_keys)} шт.) не сработали. Последняя ошибка: {last_error}"
+    return f"ERROR: Все ключи ({len(api_keys)} шт.) для провайдера '{prov}' не сработали. Последняя ошибка: {last_error}"
 
 async def safe_delete(bot: Bot, chat_id: int, message_id: int):
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
     except Exception:
-        pass # Игнорируем, если сообщение уже удалено
+        pass 
 
 # --- NEW: DIFF APPLY LOGIC ---
-# --- NEW: DIFF APPLY LOGIC ---
 def apply_patch(original_code: str, response_text: str) -> Tuple[str, str]:
-    """
-    Пытается применить SEARCH/REPLACE блоки или извлечь полный код.
-    Возвращает (итоговый код, статусное сообщение).
-    """
-    # 1. Сначала чистим <think> (мысли модели, если есть)
     text = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL | re.IGNORECASE).strip()
-    
-    # Паттерн для поиска DIFF-блоков. Добавлен \s* для учета лишних пробелов от LLM
     patch_pattern = r"<<<<<<< SEARCH\s*\n(.*?)\n=======\s*\n(.*?)\n>>>>>>>"
     
-    # Внутренняя функция применения правок
     def apply_diffs(target_code, source_text):
         matches = list(re.finditer(patch_pattern, source_text, re.DOTALL))
         if not matches:
             return target_code, 0, []
-        
         new_code = target_code
         applied_count = 0
         errors = []
-        
         for match in matches:
             search_block = match.group(1)
             replace_block = match.group(2)
-            
-            # 1. Точное совпадение
             if search_block in new_code:
                 new_code = new_code.replace(search_block, replace_block, 1)
                 applied_count += 1
-            # 2. Совпадение без пробелов по краям (частая ошибка LLM)
             elif search_block.strip() and search_block.strip() in new_code:
                 new_code = new_code.replace(search_block.strip(), replace_block, 1)
                 applied_count += 1
@@ -311,35 +303,24 @@ def apply_patch(original_code: str, response_text: str) -> Tuple[str, str]:
                 errors.append(f"Не найден фрагмент: {search_block[:30]}...")
         return new_code, applied_count, errors
 
-    # --- СТРАТЕГИЯ 1: Ищем Markdown блоки кода (```...```) ---
-    # Это решает проблему попадания Changelog'а в файл
     code_block_pattern = r"```(?:python|py|plugin)?\s*(.*?)```"
     code_blocks = list(re.finditer(code_block_pattern, text, re.DOTALL))
     
     extracted_content = None
     if code_blocks:
-        # Берем последний блок (часто модели сначала пишут пример, а потом полный код)
-        # или самый длинный. Обычно последний - самый верный.
         extracted_content = code_blocks[-1].group(1)
 
-    # Если нашли блок кода:
     if extracted_content:
-        # Проверяем, есть ли внутри этого блока Diff-метки
         if re.search(r"<<<<<<< SEARCH", extracted_content):
-            # Это DIFF, завернутый в код-блок -> Применяем к оригиналу
             new_code, count, errs = apply_diffs(original_code, extracted_content)
             status = f"Применено {count} правок (из блока кода)."
             if errs: status += f" Не найдено: {len(errs)}."
-            
-            # Формируем комментарий, вырезая код из ответа
             comment = re.sub(code_block_pattern, "", text, flags=re.DOTALL).strip()
             return new_code, f"{status}\n\n{comment}"
         else:
-            # Это Полный Код (Full Rewrite) -> Возвращаем как есть
             comment = re.sub(code_block_pattern, "", text, flags=re.DOTALL).strip()
             return extracted_content.strip(), (comment if comment else "Полная перезапись (найден блок кода).")
 
-    # --- СТРАТЕГИЯ 2: Если блоков кода нет, ищем Diff-метки в сыром тексте ---
     if re.search(r"<<<<<<< SEARCH", text):
         new_code, count, errs = apply_diffs(original_code, text)
         if count > 0:
@@ -348,7 +329,6 @@ def apply_patch(original_code: str, response_text: str) -> Tuple[str, str]:
             if errs: status += f" Не найдено: {len(errs)}."
             return new_code, f"{status}\n\n{comment}"
 
-    # --- СТРАТЕГИЯ 3: Фолбэк (ничего не понятно, возвращаем всё очищенное) ---
     return text.strip(), "Код получен (без блоков и патчей)."
 
 # --- HANDLERS (START & MENU) ---
@@ -375,11 +355,15 @@ async def cancel(c: types.CallbackQuery, state: FSMContext):
 
 async def show_tab(event, active):
     user_id = event.from_user.id
-    
     s = await get_user_settings(user_id)
     conf = PROVIDERS_CONFIG[active]
     
-    text = f"<a href='tg://emoji?id=5301096984617166561'>🤖</a> <b>Выбор модели:</b>\n\n{conf['icon']} <b>{conf['name']}:</b>\n"
+    # Подсчет сохраненных ключей для отображения статуса
+    keys_stored = s.get(f"{active}_key", "")
+    key_count = len([k for k in keys_stored.split('\n') if k.strip()]) if keys_stored else 0
+    key_status = f"✅ ({key_count})" if key_count > 0 else "❌"
+
+    text = f"<a href='tg://emoji?id=5301096984617166561'>🤖</a> <b>Выбор модели:</b>\n\n{conf['icon']} <b>{conf['name']}</b> (Ключи: {key_status}):\n"
     for _, m in conf["models"].items(): 
         text += f"• {m['name']} — {m['desc']}\n"
     
@@ -391,7 +375,9 @@ async def show_tab(event, active):
     models_keys = list(conf["models"].keys())
     for i, mid in enumerate(models_keys):
         m_data = conf["models"][mid]
-        mark = "✅" if (s["model"] == mid and s["provider"] == active) else m_data["icon"]
+        # Проверяем, выбран ли этот провайдер И эта модель
+        is_selected = (s["model"] == mid and s["provider"] == active)
+        mark = "✅" if is_selected else m_data["icon"]
         btns.append([InlineKeyboardButton(text=f"{mark} {m_data['name']}", callback_data=f"sm:{active}:{i}")])
     
     btns.append([InlineKeyboardButton(text=f"🔑 Настроить ключ {conf['name']}", callback_data=f"set_key:{active}")])
@@ -402,19 +388,20 @@ async def show_tab(event, active):
     if isinstance(event, types.Message):
         await event.answer(text=text, reply_markup=kb, parse_mode='HTML')
     elif isinstance(event, types.CallbackQuery):
-        try:
-            await event.message.edit_text(text=text, reply_markup=kb, parse_mode='HTML')
-        except Exception:
-            pass 
+        try: await event.message.edit_text(text=text, reply_markup=kb, parse_mode='HTML')
+        except: pass 
         await event.answer()
 
 @router.message(Command("settings"))
 async def settings_command(m: Message):
-    await show_tab(m, "onlysq")
+    s = await get_user_settings(m.from_user.id)
+    # Открываем вкладку текущего провайдера
+    await show_tab(m, s["provider"])
 
 @router.callback_query(F.data == "nav_main_settings")
 async def settings_callback(c: types.CallbackQuery):
-    await show_tab(c, "onlysq")
+    s = await get_user_settings(c.from_user.id)
+    await show_tab(c, s["provider"])
 
 @router.callback_query(F.data.startswith("tab:"))
 async def tab(c: types.CallbackQuery): 
@@ -426,7 +413,7 @@ async def sm(c: types.CallbackQuery):
     try:
         mid = list(PROVIDERS_CONFIG[p]["models"].keys())[int(i)]
         await update_user(c.from_user.id, c.from_user.username, model=mid, provider=p)
-        await c.answer(f"Выбрано: {mid}")
+        await c.answer(f"Выбрано: {mid} ({p})")
         await show_tab(c, p)
     except: await c.answer("Ошибка выбора")
 
@@ -434,7 +421,7 @@ async def sm(c: types.CallbackQuery):
 async def sk(c: types.CallbackQuery, state: FSMContext):
     p = c.data.split(":")[1]
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data=f"tab:{p}")]])
-    await c.message.edit_text(f"<a href='tg://emoji?id=5454386656628991407'>🔑</a> <b>Введите ключ для {p} (или reset):</b>", reply_markup=kb, parse_mode='HTML')
+    await c.message.edit_text(f"<a href='tg://emoji?id=5454386656628991407'>🔑</a> <b>Введите ключи для {p} (через пробел или с новой строки):</b>\nНапишите 'reset' для удаления.", reply_markup=kb, parse_mode='HTML')
     await state.update_data(kp=p)
     await state.set_state(GenStates.waiting_for_key)
 
@@ -442,66 +429,72 @@ async def sk(c: types.CallbackQuery, state: FSMContext):
 async def pk(m: Message, state: FSMContext):
     p = (await state.get_data())["kp"]
     
-    # ЛОГИКА СОХРАНЕНИЯ НЕСКОЛЬКИХ КЛЮЧЕЙ
     if m.text.lower() == "reset":
         key_val = "RESET"
+        count = 0
     else:
-        # Разбиваем по строкам, удаляем пустые и пробелы, склеиваем обратно через \n
-        keys = [k.strip() for k in m.text.split('\n') if k.strip()]
+        # ИСПРАВЛЕНИЕ: Разбиваем по любым пробелам, запятым и переносам строк
+        # Это решает проблему, если ключи были вставлены одной строкой
+        raw_keys = re.split(r'[\s,]+', m.text.strip())
+        keys = [k.strip() for k in raw_keys if k.strip()]
+        
         if not keys:
             await m.answer("⚠️ Вы не прислали ни одного ключа.")
             return
-        key_val = "\n".join(keys) # Сохраняем как одну строку с разделителями
+        
+        # Сохраняем в базу строго через \n
+        key_val = "\n".join(keys)
+        count = len(keys)
 
     args = {f"{p}_key": key_val}
     await update_user(m.from_user.id, m.from_user.username, **args)
     
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ Вернуться в настройки", callback_data="nav_main_settings")]])
+    # Возвращаемся в настройки этого провайдера
+    # Чтобы пользователь сразу увидел статус ключей
+    s = await get_user_settings(m.from_user.id)
     
-    count_msg = "Ключ удален." if key_val == "RESET" else f"Сохранено ключей: {len(key_val.split())} шт."
-    await m.answer(f"<a href='tg://emoji?id=5454079785510660283'>✅</a> {count_msg}", reply_markup=kb, parse_mode='HTML')
+    # Если мы настроили ключи для провайдера, который НЕ активен сейчас, предупредим пользователя
+    warning = ""
+    if s["provider"] != p:
+        warning = f"\n\n⚠️ <b>Внимание:</b> Сейчас активен провайдер <b>{s['provider']}</b>. Вы настроили <b>{p}</b>. Не забудьте выбрать модель во вкладке {p}, чтобы использовать эти ключи!"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В настройки", callback_data=f"tab:{p}") ]])
+    
+    msg_text = "Ключи удалены." if key_val == "RESET" else f"✅ Сохранено ключей: {count} шт.{warning}"
+    await m.answer(msg_text, reply_markup=kb, parse_mode='HTML')
     await state.clear()
 
 # --- HANDLERS (GENERATION) ---
 
-# In app.py
 async def execute_generation(task_id, user_id, chat_id, sys, prompt, ext, is_fix, original_code, notify_msg_id=None):
     try:
-        # Если это фикс, добавляем инструкции по DIFF
         final_prompt = prompt
         sys_prompt_final = sys
         if is_fix:
             sys_prompt_final += PROMPT_DIFF_ADDON
         
-        # Делаем запрос (логика выбора прокси уже внутри _api_request)
         res = await _api_request(sys_prompt_final, final_prompt, user_id)
         
         if res.startswith("ERROR"):
-            # Сообщаем об ошибке
-            await bot.send_message(chat_id, f"❌ Ошибка генерации: {res}")
+            await bot.send_message(chat_id, f"❌ <b>Ошибка генерации:</b>\n{res}", parse_mode="HTML")
         else:
-            # Применяем патч или берем код
             if is_fix and original_code:
                 code, note = apply_patch(original_code, res)
             else:
                 code, note = apply_patch("", res)
             
-            # Подготовка файла
             file = BufferedInputFile(code.encode(), filename=f"result.{ext}")
             kb = [[InlineKeyboardButton(text="➕ Дополнить", callback_data=f"cont:{'mod' if ext=='py' else 'plug'}"), InlineKeyboardButton(text="🔙 Меню", callback_data="cancel")]]
             
             safe_note = html.escape(note)
             caption_with_quote = f"📝 Ченджлог: <blockquote expandable>{safe_note}</blockquote>"
             
-            # Отправка результата
-            # Используем bot.send_document, так как объекта Message может не быть (при рестарте)
             if len(caption_with_quote) > 1000:
                 await bot.send_document(chat_id, file, caption="📝 Ченджлог (см. ниже):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
                 await bot.send_message(chat_id, caption_with_quote, parse_mode="HTML")
             else:
                 await bot.send_document(chat_id, file, caption=caption_with_quote, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
             
-            # Удаляем сообщение "Генерирую...", если передали ID
             if notify_msg_id:
                 await safe_delete(bot, chat_id, notify_msg_id)
 
@@ -509,24 +502,15 @@ async def execute_generation(task_id, user_id, chat_id, sys, prompt, ext, is_fix
         logger.error(f"Generation failed: {e}")
         await bot.send_message(chat_id, f"❌ Критическая ошибка при генерации: {e}")
     finally:
-        # В ЛЮБОМ СЛУЧАЕ удаляем задачу из БД, чтобы она не зациклилась
         if task_id:
             await remove_pending_gen(task_id)
 
 async def run_gen(m: Message, state: FSMContext, sys: str, prompt: str, ext: str, is_fix=False):
     await state.set_state(GenStates.generating)
-    
-    # 1. Отправляем сообщение "Генерирую..."
     wait = await m.answer("<a href='tg://emoji?id=5258281774198311547'>🧠</a> Генерирую...", parse_mode='HTML')
-    
-    # 2. Получаем original_code, если есть
     data = await state.get_data()
     original_code = data.get("original_code", "")
-    
-    # 3. Сохраняем задачу в БД
     task_id = await add_pending_gen(m.from_user.id, m.chat.id, sys, prompt, ext, is_fix, original_code)
-    
-    # 4. Запускаем выполнение в фоне (не блокируя хендлер)
     asyncio.create_task(
         execute_generation(
             task_id, m.from_user.id, m.chat.id, 
@@ -534,12 +518,6 @@ async def run_gen(m: Message, state: FSMContext, sys: str, prompt: str, ext: str
             notify_msg_id=wait.message_id
         )
     )
-    
-    # Очищаем стейт (или оставляем, как вам удобно, но original_code мы уже сохранили в БД)
-    # Если нужно сохранить original_code в стейте для дальнейших правок "Дополнить", 
-    # то в execute_generation нужно будет придумать, как обновить FSM, но это сложно без объекта стейта.
-    # Проще всего при нажатии "Дополнить" просить скинуть файл заново или сохранять в result.py
-    
     await state.set_state(None) 
 
 @router.callback_query(F.data == "nav_gen_mod")
@@ -550,12 +528,9 @@ async def n_gm(c: types.CallbackQuery, state: FSMContext):
 
 @router.message(GenStates.waiting_for_gen_mod)
 async def p_gm(m: Message, state: FSMContext):
-    # Удаляем только предыдущее сообщение бота ("Напиши ТЗ...")
     data = await state.get_data()
     if "last_msg_id" in data:
         await safe_delete(bot, m.chat.id, data["last_msg_id"])
-    
-    # Сообщение пользователя m.text остается в чате
     await run_gen(m, state, PROMPT_HIKKA_GEN, m.text, "py", is_fix=False)
 
 @router.callback_query(F.data == "nav_fix_mod")
@@ -569,12 +544,9 @@ async def p_fmf(m: Message, state: FSMContext):
     f = await bot.get_file(m.document.file_id)
     c = (await bot.download_file(f.file_path)).read().decode("utf-8", "ignore")
     await state.update_data(original_code=c)
-    
-    # Удаляем просьбу "Отправь файл"
     data = await state.get_data()
     if "last_msg_id" in data:
         await safe_delete(bot, m.chat.id, data["last_msg_id"])
-        
     msg = await m.answer("<a href='tg://emoji?id=5465542769755826716'>✅</a> Файл принят. Что исправить?", reply_markup=get_cancel_kb(), parse_mode='HTML')
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(GenStates.waiting_for_fix_mod_prompt)
@@ -582,20 +554,13 @@ async def p_fmf(m: Message, state: FSMContext):
 @router.message(GenStates.waiting_for_fix_mod_prompt)
 async def p_fmp(m: Message, state: FSMContext):
     d = await state.get_data()
-
-    # --- FIX START ---
     original_code = d.get("original_code")
     if not original_code:
-        await m.answer("<a href='tg://emoji?id=[5258121851091043775]'>❌</a> Бот не помнит код.\n<a href='tg://emoji?id=5341492148468465410'>🙏</a> Пожалуйста, <b>перешлите файл .py</b>, чтобы продолжить.", parse_mode="HTML")
+        await m.answer("❌ Нет кода. Пришли файл заново.")
         await state.set_state(GenStates.waiting_for_fix_mod_file)
         return
-    # --- FIX END ---
-    
-    # Удаляем вопрос "Что исправить?"
     if "last_msg_id" in d:
         await safe_delete(bot, m.chat.id, d["last_msg_id"])
-    
-    # Сообщение пользователя с просьбой фикса остается
     await run_gen(m, state, PROMPT_HIKKA_FIX, f"CODE:\n{original_code}\nREQ: {m.text}", "py", is_fix=True)
 
 @router.callback_query(F.data == "nav_gen_plug")
@@ -607,10 +572,8 @@ async def n_gp(c: types.CallbackQuery, state: FSMContext):
 @router.message(GenStates.waiting_for_gen_plug)
 async def p_gp(m: Message, state: FSMContext):
     data = await state.get_data()
-    # Удаляем вопрос бота
     if "last_msg_id" in data:
         await safe_delete(bot, m.chat.id, data["last_msg_id"])
-        
     await run_gen(m, state, PROMPT_EXTERA_GEN, m.text, "plugin", is_fix=False)
 
 @router.callback_query(F.data == "nav_fix_plug")
@@ -621,21 +584,15 @@ async def n_fp(c: types.CallbackQuery, state: FSMContext):
 
 @router.message(GenStates.waiting_for_fix_plug_file, F.document)
 async def handle_plugin_file(m: Message, state: FSMContext):
-    # Проверка расширения файла
     if not m.document.file_name.endswith(".plugin"):
-        await m.answer("<a href='tg://emoji?id=5454225015534805938'>❌</a> Это не .plugin файл. Попробуй еще раз.", parse_mode='HTML')
+        await m.answer("❌ Это не .plugin файл.")
         return
-
-    # Скачивание файла и сохранение кода в стейт
     f = await bot.get_file(m.document.file_id)
     c = (await bot.download_file(f.file_path)).read().decode("utf-8", "ignore")
     await state.update_data(original_code=c)
-    
-    # Удаляем просьбу "Отправь файл"
     data = await state.get_data()
     if "last_msg_id" in data:
         await safe_delete(bot, m.chat.id, data["last_msg_id"])
-        
     msg = await m.answer("<a href='tg://emoji?id=5465542769755826716'>✅</a> Файл плагина принят. Что исправить?", reply_markup=get_cancel_kb(), parse_mode='HTML')
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(GenStates.waiting_for_fix_plug_prompt)
@@ -643,20 +600,13 @@ async def handle_plugin_file(m: Message, state: FSMContext):
 @router.message(GenStates.waiting_for_fix_plug_prompt)
 async def p_fpp(m: Message, state: FSMContext):
     d = await state.get_data()
-    
-    # --- FIX START: Проверяем наличие кода ---
     original_code = d.get("original_code")
     if not original_code:
-        await m.answer("<a href='tg://emoji?id=[5258121851091043775]'>❌</a> Бот не помнит код.\n<a href='tg://emoji?id=5341492148468465410'>🙏</a> Пожалуйста, <b>перешлите этот файл</b> боту, чтобы продолжить работу над ним.", parse_mode="HTML")
-        # Переключаем состояние на ожидание файла
+        await m.answer("❌ Нет кода. Пришли файл заново.")
         await state.set_state(GenStates.waiting_for_fix_plug_file)
         return
-    # --- FIX END ---
-    
-    # Удаляем "Что исправить?"
     if "last_msg_id" in d:
         await safe_delete(bot, m.chat.id, d["last_msg_id"])
-        
     await run_gen(m, state, PROMPT_EXTERA_FIX, f"CODE:\n{original_code}\nREQ: {m.text}", "plugin", is_fix=True)
 
 @router.callback_query(F.data.startswith("cont:"))
@@ -681,44 +631,10 @@ async def dl_db(c: types.CallbackQuery):
 @router.callback_query(F.data == "ignore")
 async def ign(c: types.CallbackQuery): await c.answer()
 
-async def restore_pending_generations():
-    tasks = await get_all_pending_gens()
-    if not tasks:
-        return
-    
-    print(f"🔄 Восстановление {len(tasks)} прерванных генераций...")
-    
-    for task in tasks:
-        # task - это строка из БД (Row object)
-        # Уведомляем пользователя, что мы не забыли про него
-        try:
-            await bot.send_message(task['chat_id'], "🔄 Бот был перезагружен. Возобновляю вашу генерацию...")
-        except:
-            pass # Если юзер заблокировал бота, просто работаем дальше
-
-        # Запускаем задачу
-        asyncio.create_task(
-            execute_generation(
-                task_id=task['id'],
-                user_id=task['user_id'],
-                chat_id=task['chat_id'],
-                sys=task['sys_prompt'],
-                prompt=task['user_prompt'],
-                ext=task['ext'],
-                is_fix=bool(task['is_fix']),
-                original_code=task['original_code'],
-                notify_msg_id=None # Старое сообщение "Генерирую" мы уже не найдем/не удалим
-            )
-        )
-
 async def main():
     global http_session_direct, http_session_proxy
-    
-    # --- 1. Создаем сессии ---
     http_session_direct = aiohttp.ClientSession()
-
     if PROXY_URL:
-        # Подключаем прокси (SOCKS4/5)
         connector = ProxyConnector.from_url(PROXY_URL)
         http_session_proxy = aiohttp.ClientSession(connector=connector)
         print(f"Proxy connected: {PROXY_URL}")
@@ -726,32 +642,17 @@ async def main():
         print("WARNING: PROXY_URL not found, using direct connection.")
         http_session_proxy = aiohttp.ClientSession()
 
-    # --- 2. Запускаем бота в блоке try ---
     try:
         await init_db()
-        
-        # Если вы уже добавили функцию восстановления задач из прошлого ответа:
-        # await restore_pending_generations() 
-        
         print("Started")
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
-        
-    # --- 3. Этот блок выполнится ВСЕГДА при остановке бота ---
     finally:
         print("🛑 Closing sessions...")
-        if http_session_direct:
-            await http_session_direct.close()
-        if http_session_proxy:
-            await http_session_proxy.close()
+        if http_session_direct: await http_session_direct.close()
+        if http_session_proxy: await http_session_proxy.close()
         print("✅ Sessions closed.")
 
 if __name__ == "__main__":
-    try: 
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        print("Bot stopped!")
-
-if __name__ == "__main__":
     try: asyncio.run(main())
-    except: pass
+    except (KeyboardInterrupt, SystemExit): print("Bot stopped!")
