@@ -554,13 +554,21 @@ async def p_fmf(m: Message, state: FSMContext):
 @router.message(GenStates.waiting_for_fix_mod_prompt)
 async def p_fmp(m: Message, state: FSMContext):
     d = await state.get_data()
+
+    # --- FIX START ---
+    original_code = d.get("original_code")
+    if not original_code:
+        await m.answer("<a href='tg://emoji?id=[5258121851091043775]'>5️⃣</a> Бот не помнит код.\n<a href='tg://emoji?id=5341492148468465410'>5️⃣</a> Пожалуйста, <b>перешлите файл .py</b>, чтобы продолжить.", parse_mode="HTML")
+        await state.set_state(GenStates.waiting_for_fix_mod_file)
+        return
+    # --- FIX END ---
     
     # Удаляем вопрос "Что исправить?"
     if "last_msg_id" in d:
         await safe_delete(bot, m.chat.id, d["last_msg_id"])
     
     # Сообщение пользователя с просьбой фикса остается
-    await run_gen(m, state, PROMPT_HIKKA_FIX, f"CODE:\n{d['original_code']}\nREQ: {m.text}", "py", is_fix=True)
+    await run_gen(m, state, PROMPT_HIKKA_FIX, f"CODE:\n{original_code}\nREQ: {m.text}", "py", is_fix=True)
 
 @router.callback_query(F.data == "nav_gen_plug")
 async def n_gp(c: types.CallbackQuery, state: FSMContext):
@@ -608,11 +616,20 @@ async def handle_plugin_file(m: Message, state: FSMContext):
 async def p_fpp(m: Message, state: FSMContext):
     d = await state.get_data()
     
+    # --- FIX START: Проверяем наличие кода ---
+    original_code = d.get("original_code")
+    if not original_code:
+        await m.answer("<a href='tg://emoji?id=[5258121851091043775]'>5️⃣</a> Бот не помнит код.\n<a href='tg://emoji?id=5341492148468465410'>5️⃣</a> Пожалуйста, <b>перешлите этот файл</b> боту, чтобы продолжить работу над ним.", parse_mode="HTML")
+        # Переключаем состояние на ожидание файла
+        await state.set_state(GenStates.waiting_for_fix_plug_file)
+        return
+    # --- FIX END ---
+    
     # Удаляем "Что исправить?"
     if "last_msg_id" in d:
         await safe_delete(bot, m.chat.id, d["last_msg_id"])
         
-    await run_gen(m, state, PROMPT_EXTERA_FIX, f"CODE:\n{d['original_code']}\nREQ: {m.text}", "plugin", is_fix=True)
+    await run_gen(m, state, PROMPT_EXTERA_FIX, f"CODE:\n{original_code}\nREQ: {m.text}", "plugin", is_fix=True)
 
 @router.callback_query(F.data.startswith("cont:"))
 async def cont(c: types.CallbackQuery, state: FSMContext):
