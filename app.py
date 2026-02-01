@@ -382,7 +382,7 @@ async def sm(c: types.CallbackQuery):
 async def sk(c: types.CallbackQuery, state: FSMContext):
     p = c.data.split(":")[1]
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data=f"tab:{p}")]])
-    await c.message.edit_text(f"<a href='tg://emoji?id=5454386656628991407'>5️⃣</a> Введите ключ для {p} (или reset):", reply_markup=kb)
+    await c.message.edit_text(f"<a href='tg://emoji?id=5454386656628991407'>5️⃣</a> <b>Введите ключ для {p} (или reset):</b>", reply_markup=kb, parse_mode='HTML')
     await state.update_data(kp=p)
     await state.set_state(GenStates.waiting_for_key)
 
@@ -495,7 +495,7 @@ async def p_gm(m: Message, state: FSMContext):
 
 @router.callback_query(F.data == "nav_fix_mod")
 async def n_fm(c: types.CallbackQuery, state: FSMContext):
-    msg = await c.message.edit_text("📂 <b>Отправь файл .py:</b>", reply_markup=get_cancel_kb(), parse_mode='HTML')
+    msg = await c.message.edit_text("<a href='tg://emoji?id=5341492148468465410'>5️⃣</a> <b>Отправь файл .py:</b>", reply_markup=get_cancel_kb(), parse_mode='HTML')
     await state.update_data(last_msg_id=msg.message_id)
     await state.set_state(GenStates.waiting_for_fix_mod_file)
 
