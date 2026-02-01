@@ -90,6 +90,8 @@ PROVIDERS_CONFIG = {
         "models": {
             "gemini-pro-latest": {"name": "Gemini Pro Latest", "icon": "🌌", "desc": "Последняя модель Pro версии."},
             "gemini-flash-latest": {"name": "Gemini Flash Latest", "icon": "🌌", "desc": "Последняя модель Flash версии."},
+            "gemini-3-pro-preview": {"name": "Gemini 3 Pro", "icon": "🌌", "desc": "Третье поколение Pro версии."},
+            "gemini-3-flash-preview": {"name": "Gemini 3 Flash", "icon": "🌌", "desc": "Третье поколение Flash версии."},
             "gemini-2.5-pro": {"name": "Gemini 2.5 Pro", "icon": "💎", "desc": "Мощная и точная."},
             "gemini-2.5-flash": {"name": "Gemini 2.5 Flash", "icon": "⚡", "desc": "Скоростная."},
             "gemini-2.5-flash-lite": {"name": "Gemini 2.5 Lite", "icon": "🔦", "desc": "Flashlight версия."},
