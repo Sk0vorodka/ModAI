@@ -271,57 +271,83 @@ async def safe_delete(bot: Bot, chat_id: int, message_id: int):
         pass # Игнорируем, если сообщение уже удалено
 
 # --- NEW: DIFF APPLY LOGIC ---
+# --- NEW: DIFF APPLY LOGIC ---
 def apply_patch(original_code: str, response_text: str) -> Tuple[str, str]:
     """
-    Пытается применить SEARCH/REPLACE блоки. 
+    Пытается применить SEARCH/REPLACE блоки или извлечь полный код.
     Возвращает (итоговый код, статусное сообщение).
     """
-    # 1. Сначала чистим <think>
+    # 1. Сначала чистим <think> (мысли модели, если есть)
     text = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL | re.IGNORECASE).strip()
     
-    # 2. Проверяем наличие патчей
-    patch_pattern = r"<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>>"
-    matches = list(re.finditer(patch_pattern, text, re.DOTALL))
+    # Паттерн для поиска DIFF-блоков. Добавлен \s* для учета лишних пробелов от LLM
+    patch_pattern = r"<<<<<<< SEARCH\s*\n(.*?)\n=======\s*\n(.*?)\n>>>>>>>"
     
-    if not matches:
-        # Если патчей нет, ищем полный блок кода (старый режим)
-        m = re.search(r"```(?:python|plugin)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-        if m:
-            code = m.group(1).strip()
-            comment = re.sub(r"```.*?```", "", text, flags=re.DOTALL).strip()
-            return code, (comment if comment else "Полная перезапись.")
-        else:
-            return text.strip(), "Код получен (без блоков)."
-
-    # 3. Применяем патчи
-    new_code = original_code
-    applied_count = 0
-    errors = []
-
-    for match in matches:
-        search_block = match.group(1) # Не стрипим, важны отступы
-        replace_block = match.group(2)
+    # Внутренняя функция применения правок
+    def apply_diffs(target_code, source_text):
+        matches = list(re.finditer(patch_pattern, source_text, re.DOTALL))
+        if not matches:
+            return target_code, 0, []
         
-        # Иногда LLM добавляет лишний пробел в конце SEARCH
-        if search_block not in new_code:
-            search_block_stripped = search_block.rstrip()
-            if search_block_stripped in new_code:
-                search_block = search_block_stripped
+        new_code = target_code
+        applied_count = 0
+        errors = []
         
-        if search_block in new_code:
-            new_code = new_code.replace(search_block, replace_block, 1)
-            applied_count += 1
-        else:
-            # Попытка мягкого поиска (игнорируя отступы - ОПАСНО для Python, но иногда нужно)
-            # В данном случае лучше записать ошибку, чтобы не сломать код
-            errors.append(f"Не найден фрагмент: {search_block[:30]}...")
+        for match in matches:
+            search_block = match.group(1)
+            replace_block = match.group(2)
+            
+            # 1. Точное совпадение
+            if search_block in new_code:
+                new_code = new_code.replace(search_block, replace_block, 1)
+                applied_count += 1
+            # 2. Совпадение без пробелов по краям (частая ошибка LLM)
+            elif search_block.strip() and search_block.strip() in new_code:
+                new_code = new_code.replace(search_block.strip(), replace_block, 1)
+                applied_count += 1
+            else:
+                errors.append(f"Не найден фрагмент: {search_block[:30]}...")
+        return new_code, applied_count, errors
 
-    comment_text = re.sub(patch_pattern, "", text, flags=re.DOTALL).strip()
-    status = f"Применено {applied_count} правок."
-    if errors:
-        status += f" Не найдено: {len(errors)}."
+    # --- СТРАТЕГИЯ 1: Ищем Markdown блоки кода (```...```) ---
+    # Это решает проблему попадания Changelog'а в файл
+    code_block_pattern = r"```(?:python|py|plugin)?\s*(.*?)```"
+    code_blocks = list(re.finditer(code_block_pattern, text, re.DOTALL))
     
-    return new_code, f"{status}\n\n{comment_text}"
+    extracted_content = None
+    if code_blocks:
+        # Берем последний блок (часто модели сначала пишут пример, а потом полный код)
+        # или самый длинный. Обычно последний - самый верный.
+        extracted_content = code_blocks[-1].group(1)
+
+    # Если нашли блок кода:
+    if extracted_content:
+        # Проверяем, есть ли внутри этого блока Diff-метки
+        if re.search(r"<<<<<<< SEARCH", extracted_content):
+            # Это DIFF, завернутый в код-блок -> Применяем к оригиналу
+            new_code, count, errs = apply_diffs(original_code, extracted_content)
+            status = f"Применено {count} правок (из блока кода)."
+            if errs: status += f" Не найдено: {len(errs)}."
+            
+            # Формируем комментарий, вырезая код из ответа
+            comment = re.sub(code_block_pattern, "", text, flags=re.DOTALL).strip()
+            return new_code, f"{status}\n\n{comment}"
+        else:
+            # Это Полный Код (Full Rewrite) -> Возвращаем как есть
+            comment = re.sub(code_block_pattern, "", text, flags=re.DOTALL).strip()
+            return extracted_content.strip(), (comment if comment else "Полная перезапись (найден блок кода).")
+
+    # --- СТРАТЕГИЯ 2: Если блоков кода нет, ищем Diff-метки в сыром тексте ---
+    if re.search(r"<<<<<<< SEARCH", text):
+        new_code, count, errs = apply_diffs(original_code, text)
+        if count > 0:
+            comment = re.sub(patch_pattern, "", text, flags=re.DOTALL).strip()
+            status = f"Применено {count} правок (Raw Text)."
+            if errs: status += f" Не найдено: {len(errs)}."
+            return new_code, f"{status}\n\n{comment}"
+
+    # --- СТРАТЕГИЯ 3: Фолбэк (ничего не понятно, возвращаем всё очищенное) ---
+    return text.strip(), "Код получен (без блоков и патчей)."
 
 # --- HANDLERS (START & MENU) ---
 
