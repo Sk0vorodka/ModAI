@@ -68,6 +68,7 @@ PROMPT_DIFF_ADDON = (
     "1. The SEARCH block must match the original code EXACTLY (indentation, spaces).\n"
     "2. If you need to replace multiple parts, use multiple SEARCH/REPLACE blocks.\n"
     "3. If the file is small or changes are massive, you MAY output the full file inside ```python ... ```."
+    "if you generating a plugin, DONT USE THE CACTUSLIB!!"
 )
 
 # --- MODELS ---
@@ -466,59 +467,135 @@ async def pk(m: Message, state: FSMContext):
 
 # --- HANDLERS (GENERATION) ---
 
-async def execute_generation(task_id, user_id, chat_id, sys, prompt, ext, is_fix, original_code, notify_msg_id=None):
-    try:
-        final_prompt = prompt
-        sys_prompt_final = sys
-        if is_fix:
-            sys_prompt_final += PROMPT_DIFF_ADDON
-        
-        res = await _api_request(sys_prompt_final, final_prompt, user_id)
-        
-        if res.startswith("ERROR"):
-            await bot.send_message(chat_id, f"❌ <b>Ошибка генерации:</b>\n{res}", parse_mode="HTML")
-        else:
-            if is_fix and original_code:
-                code, note = apply_patch(original_code, res)
-            else:
-                code, note = apply_patch("", res)
-            
-            file = BufferedInputFile(code.encode(), filename=f"result.{ext}")
-            kb = [[InlineKeyboardButton(text="➕ Дополнить", callback_data=f"cont:{'mod' if ext=='py' else 'plug'}"), InlineKeyboardButton(text="🔙 Меню", callback_data="cancel")]]
-            
-            safe_note = html.escape(note)
-            caption_with_quote = f"📝 Ченджлог: <blockquote expandable>{safe_note}</blockquote>"
-            
-            if len(caption_with_quote) > 1000:
-                await bot.send_document(chat_id, file, caption="📝 Ченджлог (см. ниже):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-                await bot.send_message(chat_id, caption_with_quote, parse_mode="HTML")
-            else:
-                await bot.send_document(chat_id, file, caption=caption_with_quote, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
-            
-            if notify_msg_id:
-                await safe_delete(bot, chat_id, notify_msg_id)
+# --- 1. ФУНКЦИЯ ДЛЯ ЧТЕНИЯ ДАННЫХ ИЗ КОДА (ОБНОВЛЕННАЯ) ---
+def extract_metadata(code: str, ext: str) -> Dict[str, str]:
+    """Извлекает название, версию, ID и описание из кода."""
+    # Значения по умолчанию
+    meta = {
+        "name": "GeneratedModule",
+        "version": "1.0.0",
+        "id": "unknown",
+        "desc": "Описание отсутствует."
+    }
 
-    except Exception as e:
-        logger.error(f"Generation failed: {e}")
-        await bot.send_message(chat_id, f"❌ Критическая ошибка при генерации: {e}")
-    finally:
-        if task_id:
-            await remove_pending_gen(task_id)
+    # Если это плагин (Extera / FTG)
+    if ext == "plugin" or "__name__ =" in code:
+        name_match = re.search(r'__name__\s*=\s*["\'](.*?)["\']', code)
+        ver_match = re.search(r'__version__\s*=\s*["\'](.*?)["\']', code)
+        id_match = re.search(r'__id__\s*=\s*["\'](.*?)["\']', code)
+        desc_match = re.search(r'__description__\s*=\s*["\'](.*?)["\']', code)
 
+        if name_match: meta["name"] = name_match.group(1)
+        if ver_match: meta["version"] = ver_match.group(1)
+        if id_match: meta["id"] = id_match.group(1)
+        if desc_match: meta["desc"] = desc_match.group(1)
+
+    # Если это модуль (Hikka / Heroku)
+    else:
+        # Ищем strings = {"name": "..."}
+        hikka_name = re.search(r'strings\s*=\s*\{.*?["\']name["\']:\s*["\'](.*?)["\']', code, re.DOTALL)
+        # Ищем class Name(loader.Module):
+        class_name = re.search(r'class\s+(\w+)\(.*loader\.Module.*\):', code)
+        # Ищем описание в """Docstring""" внутри класса
+        doc_string = re.search(r'class\s+\w+\(.*loader\.Module.*\):\s*\n\s*"""(.*?)"""', code, re.DOTALL)
+        
+        if hikka_name:
+            meta["name"] = hikka_name.group(1)
+            meta["id"] = hikka_name.group(1)
+        elif class_name:
+            meta["name"] = class_name.group(1)
+            meta["id"] = class_name.group(1)
+            
+        if doc_string:
+            # Берем первую строку описания и убираем лишние пробелы
+            meta["desc"] = doc_string.group(1).strip().split('\n')[0]
+            
+        # Версия в модулях редко пишется, но попробуем найти
+        ver_match = re.search(r'version\s*=\s*["\'](.*?)["\']', code)
+        if ver_match: meta["version"] = ver_match.group(1)
+
+    # --- ГЕНЕРАЦИЯ БЕЗОПАСНОГО ИМЕНИ ФАЙЛА ---
+    safe_name = re.sub(r'[^\w\-_\.]', '', meta["name"]).replace(" ", "")
+    if not safe_name: safe_name = "result"
+    meta["safe_filename"] = safe_name
+    # -----------------------------------------
+
+    # Экранируем HTML символы, чтобы не сломать разметку телеграма
+    for k, v in meta.items():
+        meta[k] = html.escape(str(v))
+        
+    return meta
+
+# --- 2. ФУНКЦИЯ ЗАПУСКА ГЕНЕРАЦИИ (ОБНОВЛЕННАЯ) ---
 async def run_gen(m: Message, state: FSMContext, sys: str, prompt: str, ext: str, is_fix=False):
     await state.set_state(GenStates.generating)
+    
+    # Отправляем сообщение "Генерирую..."
     wait = await m.answer("<a href='tg://emoji?id=5258281774198311547'>🧠</a> Генерирую...", parse_mode='HTML')
-    data = await state.get_data()
-    original_code = data.get("original_code", "")
-    task_id = await add_pending_gen(m.from_user.id, m.chat.id, sys, prompt, ext, is_fix, original_code)
-    asyncio.create_task(
-        execute_generation(
-            task_id, m.from_user.id, m.chat.id, 
-            sys, prompt, ext, is_fix, original_code, 
-            notify_msg_id=wait.message_id
+    
+    final_prompt = prompt
+    sys_prompt_final = sys
+    if is_fix:
+        sys_prompt_final += PROMPT_DIFF_ADDON
+        
+    # Делаем запрос к AI
+    res = await _api_request(sys_prompt_final, final_prompt, m.from_user.id)
+    
+    if res.startswith("ERROR"): 
+        await wait.edit_text(f"❌ {res}")
+    else:
+        # Получаем старый код для фикса, если нужно
+        data = await state.get_data()
+        original_code = data.get("original_code", "")
+        
+        # Применяем изменения или берем новый код
+        if is_fix and original_code:
+            code, note = apply_patch(original_code, res)
+        else:
+            code, note = apply_patch("", res)
+            
+        await state.update_data(original_code=code)
+        
+        # --- НОВАЯ ЛОГИКА ОФОРМЛЕНИЯ ---
+        meta = extract_metadata(code, ext)
+        
+        # Формируем имя файла
+        filename = f"{meta['safe_filename']}-v{meta['version']}.{ext}"
+        file = BufferedInputFile(code.encode(), filename=filename)
+        
+        # Формируем красивую подпись
+        safe_note = html.escape(note)
+        
+        caption_text = (
+            f"📦 <b>{meta['name']}</b> v{meta['version']}\n"
+            f"🆔 <code>{meta['id']}</code>\n"
+            f"📄 <i>{meta['desc']}</i>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📝 <b>Ченджлог:</b>\n"
+            f"<blockquote expandable>{safe_note}</blockquote>"
         )
-    )
-    await state.set_state(None) 
+        
+        kb = [[InlineKeyboardButton(text="➕ Дополнить", callback_data=f"cont:{'mod' if ext=='py' else 'plug'}"), InlineKeyboardButton(text="🔙 Меню", callback_data="cancel")]]
+        
+        # Отправляем результат
+        try:
+            # Удаляем сообщение "Генерирую..." перед отправкой нового
+            await wait.delete()
+            
+            if len(caption_text) > 1024:
+                # Если текст длинный, шлем файл и текст отдельно
+                await m.answer_document(file, caption=f"📦 <b>{meta['name']}</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+                await m.answer(caption_text, parse_mode="HTML")
+            else:
+                # Если влезает, шлем все вместе
+                await m.answer_document(file, caption=caption_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+                
+        except Exception as e:
+            logger.error(f"Send error: {e}")
+            # Фолбэк на случай ошибки
+            await m.answer_document(file, caption=f"📦 {meta['name']}\n\n📝 {safe_note[:900]}", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+    await state.set_state(None)
 
 @router.callback_query(F.data == "nav_gen_mod")
 async def n_gm(c: types.CallbackQuery, state: FSMContext):
