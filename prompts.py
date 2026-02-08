@@ -1320,6 +1320,337 @@ _send_message_and_dismiss_dialog dismisses the progress dialog and then uses cli
 The original message sending is cancelled by returning HookResult(strategy=HookStrategy.CANCEL).
 This approach ensures the UI remains responsive while fetching data
 
+также посмотри на этот пример плагина, тут собраны все виды настроек, используй их в зависимости от запроса:
+__id__ = "example_settings"
+__name__ = "Example Settings Plugin"
+__description__ = "Пример плагина с настройками, переходами по ссылкам, кнопками и обновлением"
+__author__ = "@gemeguardian"
+__version__ = "1.0"
+__min_version__ = "10.14.4"
+__icon__ = "msg_settings"
+
+from ui.settings import Header, Input, Divider, Switch, Selector, Text, EditText
+from android.view import View
+from android.content import Intent
+from android.net import Uri
+from typing import List, Any
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from client_utils import get_last_fragment
+from android_utils import run_on_ui_thread, log
+
+class ExampleSettingsPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._click_count = 0
+        self.log("[ExampleSettings] Plugin initialized")
+
+    def _log_settings_access(self, method: str, key: str = None, value: Any = None):
+        try:
+            if key and value is not None:
+                self.log(f"[ExampleSettings] {method} - {key}: {value} (type: {type(value).__name__})")
+            else:
+                self.log(f"[ExampleSettings] {method}")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error in _log_settings_access: {e}")
+
+    def _on_test_switch_change(self, new_value: bool):
+        try:
+            self._log_settings_access("Switch changed", "test_switch_key", new_value)
+            self.log(f"[ExampleSettings] Test switch changed to: {new_value}")
+            BulletinHelper.show_info(f"Переключатель: {'Включен' if new_value else 'Выключен'}")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error in _on_test_switch_change: {e}")
+
+    def _on_test_input_change(self, new_value: str):
+        try:
+            self._log_settings_access("Input changed", "test_input_key", new_value)
+            self.log(f"[ExampleSettings] Test input changed to: {new_value}")
+            if len(new_value) > 10:
+                BulletinHelper.show_info("Текст слишком длинный!")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error in _on_test_input_change: {e}")
+
+    def _on_test_selector_change(self, new_index: int):
+        try:
+            self._log_settings_access("Selector changed", "test_selector_key", new_index)
+            self.log(f"[ExampleSettings] Test selector changed to index: {new_index}")
+            options = ["Вариант А", "Вариант Б", "Вариант В"]
+            BulletinHelper.show_success(f"Выбран: {options[new_index]}")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error in _on_test_selector_change: {e}")
+
+    def _on_text_click(self, view: View):
+        try:
+            self.log("[ExampleSettings] Text item clicked!")
+            self._click_count += 1
+            self.set_setting("click_count", self._click_count)
+            self.set_setting("click_count", self._click_count, reload_settings=True)
+            self._log_settings_access("Button clicked", "click_count", self._click_count)
+            BulletinHelper.show_info(f"Кнопка нажата {self._click_count} раз")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error in _on_text_click: {e}")
+
+    def _on_info_button_click(self, view: View):
+        try:
+            self.log("[ExampleSettings] Opening info dialog")
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if not activity:
+                self.log("[ExampleSettings] Error: No activity found")
+                return
+                
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Информация о плагине")
+            builder.set_message("Это пример плагина демонстрирующий различные элементы настроек:\n\n"
+                             "• Переключатели (Switch)\n"
+                             "• Поля ввода (Input/EditText)\n"
+                             "• Селекторы (Selector)\n"
+                             "• Кликабельный текст (Text)\n"
+                             "• Переходы по ссылкам\n"
+                             "• Диалоговые окна\n"
+                             "• Обновление настроек")
+            builder.set_positive_button("Понятно")
+            builder.show()
+            self.log("[ExampleSettings] Info dialog shown successfully")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error showing info dialog: {e}")
+
+    def _on_github_click(self, view: View):
+        try:
+            self.log("[ExampleSettings] Opening GitHub link")
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if activity:
+                intent = Intent(Intent.ACTION_VIEW)
+                intent.setData(Uri.parse("https://github.com"))
+                activity.startActivity(intent)
+                BulletinHelper.show_success("Открытие GitHub...")
+                self.log("[ExampleSettings] GitHub link opened successfully")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error opening GitHub: {e}")
+            BulletinHelper.show_error("Не удалось открыть ссылку")
+
+    def _on_telegram_click(self, view: View):
+        try:
+            self.log("[ExampleSettings] Opening Telegram link")
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if activity:
+                intent = Intent(Intent.ACTION_VIEW)
+                intent.setData(Uri.parse("https://t.me/durov"))
+                activity.startActivity(intent)
+                BulletinHelper.show_success("Открытие Telegram...")
+                self.log("[ExampleSettings] Telegram link opened successfully")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error opening Telegram: {e}")
+            BulletinHelper.show_error("Не удалось открыть ссылку")
+
+    def _on_refresh_settings_click(self, view: View):
+        try:
+            self.log("[ExampleSettings] Refreshing settings")
+            current_value = self.get_setting("refresh_counter", 0)
+            new_value = current_value + 1
+            self._log_settings_access("Before refresh", "refresh_counter", current_value)
+            self._log_settings_access("After refresh", "refresh_counter", new_value)
+            self.set_setting("refresh_counter", new_value)
+            self.set_setting("click_count", self.get_setting("click_count", 0), reload_settings=True)
+            BulletinHelper.show_success(f"Настройки обновлены! Счетчик: {new_value}")
+            self.log(f"[ExampleSettings] Settings refreshed successfully, counter: {new_value}")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error refreshing settings: {e}")
+            BulletinHelper.show_error("Ошибка обновления настроек")
+
+    def _on_reset_settings_click(self, view: View):
+        try:
+            self.log("[ExampleSettings] Opening reset dialog")
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if not activity:
+                self.log("[ExampleSettings] Error: No activity found for reset dialog")
+                return
+                
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Сброс настроек")
+            builder.set_message("Вы уверены, что хотите сбросить все настройки к значениям по умолчанию?")
+            
+            def on_confirm(dialog_builder, button_id):
+                try:
+                    self.log("[ExampleSettings] User confirmed reset")
+                    self.set_setting("test_switch_key", True)
+                    self.set_setting("test_selector_key", 1)
+                    self.set_setting("test_input_key", "Hello, World!")
+                    self.set_setting("multiline_key", "")
+                    self.set_setting("refresh_counter", 0)
+                    self._click_count = 0
+                    self.set_setting("click_count", 0)
+                    self.set_setting("test_input_key", "Hello, World!", reload_settings=True)
+                    BulletinHelper.show_success("Настройки сброшены!")
+                    self.log("[ExampleSettings] Settings reset successfully")
+                except Exception as e:
+                    self.log(f"[ExampleSettings] Error resetting settings: {e}")
+                    BulletinHelper.show_error("Ошибка сброса настроек")
+                    
+                dialog_builder.dismiss()
+            
+            builder.set_positive_button("Сбросить", on_confirm)
+            builder.set_negative_button("Отмена")
+            builder.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+            builder.show()
+            self.log("[ExampleSettings] Reset dialog shown")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error showing reset dialog: {e}")
+
+    def _create_links_page(self) -> List[Any]:
+        try:
+            self.log("[ExampleSettings] Creating links page")
+            return [
+                Header(text="Полезные ссылки"),
+                Text(text="GitHub", icon="msg_link", on_click=self._on_github_click),
+                Text(text="Telegram", icon="msg_link", on_click=self._on_telegram_click),
+                Header(text="Внешние ресурсы"),
+                Text(text="Документация", icon="msg_info", on_click=lambda v: self._open_link("https://docs.python.org")),
+                Text(text="Stack Overflow", icon="msg_info", on_click=lambda v: self._open_link("https://stackoverflow.com")),
+                Text(text="Официальный сайт Telegram", icon="msg_link", on_click=lambda v: self._open_link("https://telegram.org")),
+                Text(text="Android Developers", icon="msg_info", on_click=lambda v: self._open_link("https://developer.android.com")),
+            ]
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error creating links page: {e}")
+            return []
+
+    def _open_link(self, url: str):
+        try:
+            self.log(f"[ExampleSettings] Opening link: {url}")
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if activity:
+                intent = Intent(Intent.ACTION_VIEW)
+                intent.setData(Uri.parse(url))
+                activity.startActivity(intent)
+                self.log(f"[ExampleSettings] Link opened successfully: {url}")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error opening link {url}: {e}")
+
+    def create_settings(self) -> List[Any]:
+        try:
+            self.log("[ExampleSettings] Creating settings")
+            refresh_count = self.get_setting("refresh_counter", 0)
+            click_count = self.get_setting("click_count", 0)
+            self._log_settings_access("Settings loaded", "refresh_counter", refresh_count)
+            self._log_settings_access("Settings loaded", "click_count", click_count)
+            
+            settings_list = [
+                Header(text="Основные настройки"),
+                Switch(
+                    key="test_switch_key",
+                    text="Тестовый переключатель",
+                    default=True,
+                    icon="msg_settings",
+                    on_change=self._on_test_switch_change,
+                    link_alias="test_switch"
+                ),
+                Selector(
+                    key="test_selector_key",
+                    text="Селектор опций",
+                    default=1,
+                    items=["Вариант А", "Вариант Б", "Вариант В"],
+                    icon="msg_list",
+                    on_change=self._on_test_selector_change
+                ),
+                Divider(),
+                Header(text="Текстовые поля"),
+                Input(
+                    key="test_input_key",
+                    text="Поле ввода текста",
+                    default="Hello, World!",
+                    icon="msg_text",
+                    on_change=self._on_test_input_change
+                ),
+                EditText(
+                    key="multiline_key",
+                    hint="Введите многострочный текст здесь...",
+                    default="Это многострочное\nполе ввода\nпо умолчанию",
+                    multiline=True,
+                    max_length=500
+                ),
+                Header(text="Действия и ссылки"),
+                Text(
+                    text="Показать информацию",
+                    icon="msg_info",
+                    on_click=self._on_info_button_click
+                ),
+                Text(
+                    text="Обновить настройки",
+                    icon="msg_refresh",
+                    on_click=self._on_refresh_settings_click,
+                    accent=True
+                ),
+                Text(
+                    text="Сбросить настройки",
+                    icon="menu_delete",
+                    on_click=self._on_reset_settings_click,
+                    red=True
+                ),
+                Divider(),
+                Text(
+                    text="Полезные ссылки",
+                    icon="msg_link",
+                    create_sub_fragment=self._create_links_page,
+                    link_alias="links_page"
+                ),
+                Divider(),
+                Text(
+                    text=f"Нажато раз: {click_count}",
+                    icon="msg_like"
+                ),
+                Text(
+                    text="Нажми на меня!",
+                    icon="msg_like",
+                    on_click=self._on_text_click,
+                    accent=True
+                )
+            ]
+            
+            self.log(f"[ExampleSettings] Settings created successfully, {len(settings_list)} items")
+            return settings_list
+            
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error creating settings: {e}")
+            return [
+                Header(text="Ошибка загрузки настроек"),
+                Text(text=f"Произошла ошибка: {str(e)}", icon="msg_error", red=True)
+            ]
+
+    def on_plugin_load(self):
+        try:
+            self.log("[ExampleSettings] Plugin loading started")
+            BulletinHelper.show_success("Плагин настроек загружен!")
+            
+            is_enabled = self.get_setting("test_switch_key", False)
+            self._log_settings_access("Plugin load", "test_switch_key", is_enabled)
+            self.log(f"[ExampleSettings] Switch is enabled: {is_enabled}")
+            
+            if self.get_setting("refresh_counter", None) is None:
+                self.set_setting("refresh_counter", 0)
+                self.log("[ExampleSettings] Refresh counter initialized to 0")
+                
+            if self.get_setting("click_count", None) is None:
+                self.set_setting("click_count", 0)
+                self.log("[ExampleSettings] Click counter initialized to 0")
+            
+            self.log("[ExampleSettings] Plugin loaded successfully")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error in on_plugin_load: {e}")
+
+    def on_plugin_unload(self):
+        try:
+            self.log("[ExampleSettings] Plugin unloading started")
+            BulletinHelper.show_info("Плагин настроек выгружен!")
+            self.log("[ExampleSettings] Plugin unloaded successfully")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error in on_plugin_unload: {e}")
+
 Plugin Class
 Understand the Plugin class structure.
 
@@ -6220,6 +6551,337 @@ _send_message_and_dismiss_dialog dismisses the progress dialog and then uses cli
 The original message sending is cancelled by returning HookResult(strategy=HookStrategy.CANCEL).
 This approach ensures the UI remains responsive while fetching data
 
+также посмотри на этот пример плагина, тут собраны все виды настроек, используй их в зависимости от запроса:
+__id__ = "example_settings"
+__name__ = "Example Settings Plugin"
+__description__ = "Пример плагина с настройками, переходами по ссылкам, кнопками и обновлением"
+__author__ = "@gemeguardian"
+__version__ = "1.0"
+__min_version__ = "10.14.4"
+__icon__ = "msg_settings"
+
+from ui.settings import Header, Input, Divider, Switch, Selector, Text, EditText
+from android.view import View
+from android.content import Intent
+from android.net import Uri
+from typing import List, Any
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from client_utils import get_last_fragment
+from android_utils import run_on_ui_thread, log
+
+class ExampleSettingsPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._click_count = 0
+        self.log("[ExampleSettings] Plugin initialized")
+
+    def _log_settings_access(self, method: str, key: str = None, value: Any = None):
+        try:
+            if key and value is not None:
+                self.log(f"[ExampleSettings] {method} - {key}: {value} (type: {type(value).__name__})")
+            else:
+                self.log(f"[ExampleSettings] {method}")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error in _log_settings_access: {e}")
+
+    def _on_test_switch_change(self, new_value: bool):
+        try:
+            self._log_settings_access("Switch changed", "test_switch_key", new_value)
+            self.log(f"[ExampleSettings] Test switch changed to: {new_value}")
+            BulletinHelper.show_info(f"Переключатель: {'Включен' if new_value else 'Выключен'}")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error in _on_test_switch_change: {e}")
+
+    def _on_test_input_change(self, new_value: str):
+        try:
+            self._log_settings_access("Input changed", "test_input_key", new_value)
+            self.log(f"[ExampleSettings] Test input changed to: {new_value}")
+            if len(new_value) > 10:
+                BulletinHelper.show_info("Текст слишком длинный!")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error in _on_test_input_change: {e}")
+
+    def _on_test_selector_change(self, new_index: int):
+        try:
+            self._log_settings_access("Selector changed", "test_selector_key", new_index)
+            self.log(f"[ExampleSettings] Test selector changed to index: {new_index}")
+            options = ["Вариант А", "Вариант Б", "Вариант В"]
+            BulletinHelper.show_success(f"Выбран: {options[new_index]}")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error in _on_test_selector_change: {e}")
+
+    def _on_text_click(self, view: View):
+        try:
+            self.log("[ExampleSettings] Text item clicked!")
+            self._click_count += 1
+            self.set_setting("click_count", self._click_count)
+            self.set_setting("click_count", self._click_count, reload_settings=True)
+            self._log_settings_access("Button clicked", "click_count", self._click_count)
+            BulletinHelper.show_info(f"Кнопка нажата {self._click_count} раз")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error in _on_text_click: {e}")
+
+    def _on_info_button_click(self, view: View):
+        try:
+            self.log("[ExampleSettings] Opening info dialog")
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if not activity:
+                self.log("[ExampleSettings] Error: No activity found")
+                return
+                
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Информация о плагине")
+            builder.set_message("Это пример плагина демонстрирующий различные элементы настроек:\n\n"
+                             "• Переключатели (Switch)\n"
+                             "• Поля ввода (Input/EditText)\n"
+                             "• Селекторы (Selector)\n"
+                             "• Кликабельный текст (Text)\n"
+                             "• Переходы по ссылкам\n"
+                             "• Диалоговые окна\n"
+                             "• Обновление настроек")
+            builder.set_positive_button("Понятно")
+            builder.show()
+            self.log("[ExampleSettings] Info dialog shown successfully")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error showing info dialog: {e}")
+
+    def _on_github_click(self, view: View):
+        try:
+            self.log("[ExampleSettings] Opening GitHub link")
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if activity:
+                intent = Intent(Intent.ACTION_VIEW)
+                intent.setData(Uri.parse("https://github.com"))
+                activity.startActivity(intent)
+                BulletinHelper.show_success("Открытие GitHub...")
+                self.log("[ExampleSettings] GitHub link opened successfully")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error opening GitHub: {e}")
+            BulletinHelper.show_error("Не удалось открыть ссылку")
+
+    def _on_telegram_click(self, view: View):
+        try:
+            self.log("[ExampleSettings] Opening Telegram link")
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if activity:
+                intent = Intent(Intent.ACTION_VIEW)
+                intent.setData(Uri.parse("https://t.me/durov"))
+                activity.startActivity(intent)
+                BulletinHelper.show_success("Открытие Telegram...")
+                self.log("[ExampleSettings] Telegram link opened successfully")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error opening Telegram: {e}")
+            BulletinHelper.show_error("Не удалось открыть ссылку")
+
+    def _on_refresh_settings_click(self, view: View):
+        try:
+            self.log("[ExampleSettings] Refreshing settings")
+            current_value = self.get_setting("refresh_counter", 0)
+            new_value = current_value + 1
+            self._log_settings_access("Before refresh", "refresh_counter", current_value)
+            self._log_settings_access("After refresh", "refresh_counter", new_value)
+            self.set_setting("refresh_counter", new_value)
+            self.set_setting("click_count", self.get_setting("click_count", 0), reload_settings=True)
+            BulletinHelper.show_success(f"Настройки обновлены! Счетчик: {new_value}")
+            self.log(f"[ExampleSettings] Settings refreshed successfully, counter: {new_value}")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error refreshing settings: {e}")
+            BulletinHelper.show_error("Ошибка обновления настроек")
+
+    def _on_reset_settings_click(self, view: View):
+        try:
+            self.log("[ExampleSettings] Opening reset dialog")
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if not activity:
+                self.log("[ExampleSettings] Error: No activity found for reset dialog")
+                return
+                
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Сброс настроек")
+            builder.set_message("Вы уверены, что хотите сбросить все настройки к значениям по умолчанию?")
+            
+            def on_confirm(dialog_builder, button_id):
+                try:
+                    self.log("[ExampleSettings] User confirmed reset")
+                    self.set_setting("test_switch_key", True)
+                    self.set_setting("test_selector_key", 1)
+                    self.set_setting("test_input_key", "Hello, World!")
+                    self.set_setting("multiline_key", "")
+                    self.set_setting("refresh_counter", 0)
+                    self._click_count = 0
+                    self.set_setting("click_count", 0)
+                    self.set_setting("test_input_key", "Hello, World!", reload_settings=True)
+                    BulletinHelper.show_success("Настройки сброшены!")
+                    self.log("[ExampleSettings] Settings reset successfully")
+                except Exception as e:
+                    self.log(f"[ExampleSettings] Error resetting settings: {e}")
+                    BulletinHelper.show_error("Ошибка сброса настроек")
+                    
+                dialog_builder.dismiss()
+            
+            builder.set_positive_button("Сбросить", on_confirm)
+            builder.set_negative_button("Отмена")
+            builder.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+            builder.show()
+            self.log("[ExampleSettings] Reset dialog shown")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error showing reset dialog: {e}")
+
+    def _create_links_page(self) -> List[Any]:
+        try:
+            self.log("[ExampleSettings] Creating links page")
+            return [
+                Header(text="Полезные ссылки"),
+                Text(text="GitHub", icon="msg_link", on_click=self._on_github_click),
+                Text(text="Telegram", icon="msg_link", on_click=self._on_telegram_click),
+                Header(text="Внешние ресурсы"),
+                Text(text="Документация", icon="msg_info", on_click=lambda v: self._open_link("https://docs.python.org")),
+                Text(text="Stack Overflow", icon="msg_info", on_click=lambda v: self._open_link("https://stackoverflow.com")),
+                Text(text="Официальный сайт Telegram", icon="msg_link", on_click=lambda v: self._open_link("https://telegram.org")),
+                Text(text="Android Developers", icon="msg_info", on_click=lambda v: self._open_link("https://developer.android.com")),
+            ]
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error creating links page: {e}")
+            return []
+
+    def _open_link(self, url: str):
+        try:
+            self.log(f"[ExampleSettings] Opening link: {url}")
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if activity:
+                intent = Intent(Intent.ACTION_VIEW)
+                intent.setData(Uri.parse(url))
+                activity.startActivity(intent)
+                self.log(f"[ExampleSettings] Link opened successfully: {url}")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error opening link {url}: {e}")
+
+    def create_settings(self) -> List[Any]:
+        try:
+            self.log("[ExampleSettings] Creating settings")
+            refresh_count = self.get_setting("refresh_counter", 0)
+            click_count = self.get_setting("click_count", 0)
+            self._log_settings_access("Settings loaded", "refresh_counter", refresh_count)
+            self._log_settings_access("Settings loaded", "click_count", click_count)
+            
+            settings_list = [
+                Header(text="Основные настройки"),
+                Switch(
+                    key="test_switch_key",
+                    text="Тестовый переключатель",
+                    default=True,
+                    icon="msg_settings",
+                    on_change=self._on_test_switch_change,
+                    link_alias="test_switch"
+                ),
+                Selector(
+                    key="test_selector_key",
+                    text="Селектор опций",
+                    default=1,
+                    items=["Вариант А", "Вариант Б", "Вариант В"],
+                    icon="msg_list",
+                    on_change=self._on_test_selector_change
+                ),
+                Divider(),
+                Header(text="Текстовые поля"),
+                Input(
+                    key="test_input_key",
+                    text="Поле ввода текста",
+                    default="Hello, World!",
+                    icon="msg_text",
+                    on_change=self._on_test_input_change
+                ),
+                EditText(
+                    key="multiline_key",
+                    hint="Введите многострочный текст здесь...",
+                    default="Это многострочное\nполе ввода\nпо умолчанию",
+                    multiline=True,
+                    max_length=500
+                ),
+                Header(text="Действия и ссылки"),
+                Text(
+                    text="Показать информацию",
+                    icon="msg_info",
+                    on_click=self._on_info_button_click
+                ),
+                Text(
+                    text="Обновить настройки",
+                    icon="msg_refresh",
+                    on_click=self._on_refresh_settings_click,
+                    accent=True
+                ),
+                Text(
+                    text="Сбросить настройки",
+                    icon="menu_delete",
+                    on_click=self._on_reset_settings_click,
+                    red=True
+                ),
+                Divider(),
+                Text(
+                    text="Полезные ссылки",
+                    icon="msg_link",
+                    create_sub_fragment=self._create_links_page,
+                    link_alias="links_page"
+                ),
+                Divider(),
+                Text(
+                    text=f"Нажато раз: {click_count}",
+                    icon="msg_like"
+                ),
+                Text(
+                    text="Нажми на меня!",
+                    icon="msg_like",
+                    on_click=self._on_text_click,
+                    accent=True
+                )
+            ]
+            
+            self.log(f"[ExampleSettings] Settings created successfully, {len(settings_list)} items")
+            return settings_list
+            
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error creating settings: {e}")
+            return [
+                Header(text="Ошибка загрузки настроек"),
+                Text(text=f"Произошла ошибка: {str(e)}", icon="msg_error", red=True)
+            ]
+
+    def on_plugin_load(self):
+        try:
+            self.log("[ExampleSettings] Plugin loading started")
+            BulletinHelper.show_success("Плагин настроек загружен!")
+            
+            is_enabled = self.get_setting("test_switch_key", False)
+            self._log_settings_access("Plugin load", "test_switch_key", is_enabled)
+            self.log(f"[ExampleSettings] Switch is enabled: {is_enabled}")
+            
+            if self.get_setting("refresh_counter", None) is None:
+                self.set_setting("refresh_counter", 0)
+                self.log("[ExampleSettings] Refresh counter initialized to 0")
+                
+            if self.get_setting("click_count", None) is None:
+                self.set_setting("click_count", 0)
+                self.log("[ExampleSettings] Click counter initialized to 0")
+            
+            self.log("[ExampleSettings] Plugin loaded successfully")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error in on_plugin_load: {e}")
+
+    def on_plugin_unload(self):
+        try:
+            self.log("[ExampleSettings] Plugin unloading started")
+            BulletinHelper.show_info("Плагин настроек выгружен!")
+            self.log("[ExampleSettings] Plugin unloaded successfully")
+        except Exception as e:
+            self.log(f"[ExampleSettings] Error in on_plugin_unload: {e}")
+
 Plugin Class
 Understand the Plugin class structure.
 
@@ -10665,3 +11327,4 @@ sPluginIDE/46 - Предупреждение """
     "1. Write a USER-FRIENDLY changelog in Russian. Explain WHAT features were added for the user (e.g., 'Добавил команду .kick для исключения...', NOT 'Added function def kick').\n"
     "2. Write the code INSIDE a ```python ... ``` block.\n\n"
     "DONT USE CACTUSLIB!")
+
