@@ -5,6 +5,7 @@ import re
 import html
 import math
 import difflib
+import itertools
 import os
 from typing import Optional, Dict, List, Any, Tuple
 
@@ -49,7 +50,8 @@ router = Router()
 dp.include_router(router)
 
 http_session_direct: Optional[aiohttp.ClientSession] = None
-http_session_proxy: Optional[aiohttp.ClientSession] = None
+proxy_sessions: List[aiohttp.ClientSession] = [] # Список сессий
+proxy_cycle: Optional[itertools.cycle] = None 
 
 # --- DIFF SYSTEM CONSTANTS ---
 PROMPT_DIFF_ADDON = (
@@ -210,68 +212,86 @@ async def _api_request(sys, user, user_id):
     prov = s["provider"]
     conf = PROVIDERS_CONFIG.get(prov, PROVIDERS_CONFIG["onlysq"])
     
-    # 1. Получаем строку с ключами (приоритет: БД пользователя -> ENV переменная)
+    # 1. Получаем ключи
     user_keys = s.get(f"{prov}_key")
     if user_keys and len(user_keys.strip()) > 5:
-         # Если в базе есть ключи - используем их
         key_data = user_keys
     else:
-        # Иначе пробуем дефолтный ключ (только для OnlySQ)
         key_data = os.getenv("ONLYSQ_KEY") if prov == "onlysq" else None
 
     if not key_data: 
-        return f"ERROR: Ключи для провайдера '{prov}' не установлены в настройках, а дефолтный ключ отсутствует."
+        return f"ERROR: Ключи для провайдера '{prov}' не установлены."
     
-    # 2. Разбиваем ключи (учитываем любые разделители для надежности)
+    # Разбиваем ключи
     api_keys = [k.strip() for k in key_data.split('\n') if k.strip()]
     
+    # Формируем URL
     url = conf["base_url"]
     if not url.endswith("/chat/completions"):
         if url.endswith("/"): url = url[:-1]
         url = f"{url}/chat/completions"
         
-    data = {"model": s["model"], "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}], "max_tokens": MAX_TOKENS}
+    data = {
+        "model": s["model"], 
+        "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}], 
+        "max_tokens": MAX_TOKENS
+    }
     
-    # Выбор сессии
-    if prov == "onlysq":
-        current_session = http_session_direct
-    else:
-        current_session = http_session_proxy if http_session_proxy else http_session_direct
-
     last_error = ""
-    success = False
     
-    # --- ЦИКЛ ПЕРЕБОРА КЛЮЧЕЙ ---
-    for index, current_key in enumerate(api_keys):
-        headers = {"Authorization": f"Bearer {current_key}", "Content-Type": "application/json"}
-        if prov == "openrouter":
-            headers["HTTP-Referer"] = "https://t.me/AiModuleBot"
-            headers["X-Title"] = "ModAI Bot"
+    # Настройки таймаута: 
+    # sock_connect=5 -> если прокси не отвечает за 5 сек, бросаем её
+    timeout_settings = aiohttp.ClientTimeout(total=120, sock_connect=5, sock_read=115)
 
-        try:
-            async with current_session.post(url, headers=headers, json=data, timeout=300) as resp:
-                if resp.status == 200: 
-                    res = await resp.json()
-                    return res["choices"][0]["message"]["content"]
-                
-                err = await resp.text()
-                
-                # Логируем ошибку, но пробуем следующий ключ
-                last_error = f"Key #{index+1} ({prov}) Err: {resp.status} - {err[:100]}"
-                logger.warning(last_error)
+    # --- ВНЕШНИЙ ЦИКЛ: ПЕРЕБОР КЛЮЧЕЙ ---
+    for key_index, current_key in enumerate(api_keys):
+        
+        # --- ВНУТРЕННИЙ ЦИКЛ: ПОПЫТКИ (смена прокси) ---
+        max_retries = 5 
+        
+        for attempt in range(max_retries):
+            # 1. Выбираем сессию (прокси)
+            if proxy_cycle:
+                try:
+                    current_session = next(proxy_cycle)
+                except StopIteration:
+                    current_session = http_session_direct
+            else:
+                current_session = http_session_direct
+                max_retries = 1 # Если прокси нет, пробуем 1 раз
 
-                # Если ошибка фатальная (400 - Bad Request, 404 - Not Found), нет смысла перебирать ключи
-                if resp.status in [400, 404]:
-                    return f"ERROR: Критическая ошибка API ({resp.status}): {err[:200]}"
-                
-                # Для 429 (лимиты), 401 (плохой ключ), 403 (бан/доступ) -> идем дальше
+            # 2. Формируем заголовки
+            headers = {"Authorization": f"Bearer {current_key}", "Content-Type": "application/json"}
+            if prov == "openrouter":
+                headers["HTTP-Referer"] = "https://t.me/AiModuleBot"
+                headers["X-Title"] = "ModAI Bot"
+
+            # 3. Делаем запрос
+            try:
+                async with current_session.post(url, headers=headers, json=data, timeout=timeout_settings) as resp:
+                    if resp.status == 200: 
+                        res = await resp.json()
+                        return res["choices"][0]["message"]["content"]
+                    
+                    err_text = await resp.text()
+                    last_error = f"Key #{key_index+1} (Att {attempt+1}) Err: {resp.status}"
+                    logger.warning(f"⚠️ API Fail: {last_error} | {err_text[:50]}")
+
+                    # Если ошибка 401/403 (Плохой ключ) - меняем КЛЮЧ (break из внутреннего цикла)
+                    if resp.status in [400, 401, 403, 404]:
+                        break 
+                    
+                    # Если 429/500 - меняем ПРОКСИ (continue внутри attempts)
+                    continue 
+                    
+            except Exception as e:
+                # Ошибки соединения с прокси
+                last_error = f"Proxy Fail (Key #{key_index+1}, Att {attempt+1}): {e}"
+                logger.error(last_error)
+                # Идем на следующий круг attempt -> берем следующую прокси
                 continue 
-                
-        except Exception as e:
-            last_error = f"Connection Err: {e}"
-            continue 
 
-    return f"ERROR: Все ключи ({len(api_keys)} шт.) для провайдера '{prov}' не сработали. Последняя ошибка: {last_error}"
+    return f"ERROR: Не удалось получить ответ. Перебрано ключей: {len(api_keys)}. Последняя ошибка: {last_error}"
 
 async def safe_delete(bot: Bot, chat_id: int, message_id: int):
     try:
@@ -709,25 +729,55 @@ async def dl_db(c: types.CallbackQuery):
 async def ign(c: types.CallbackQuery): await c.answer()
 
 async def main():
-    global http_session_direct, http_session_proxy
+    global http_session_direct, proxy_sessions, proxy_cycle
+    
+    # 1. Прямая сессия (для OnlySQ и если нет прокси)
     http_session_direct = aiohttp.ClientSession()
-    if PROXY_URL:
-        connector = ProxyConnector.from_url(PROXY_URL)
-        http_session_proxy = aiohttp.ClientSession(connector=connector)
-        print(f"Proxy connected: {PROXY_URL}")
+
+    # 2. Загрузка прокси из .env
+    proxies_env = os.getenv("PROXIES", "")
+    # Если PROXIES пусто, пробуем старый вариант PROXY_URL для совместимости
+    if not proxies_env and os.getenv("PROXY_URL"):
+        proxies_env = os.getenv("PROXY_URL")
+
+    if proxies_env:
+        # Разбиваем по запятой, удаляем пробелы
+        proxy_list = [p.strip() for p in proxies_env.split(",") if p.strip()]
+        
+        print(f"🔄 Loading {len(proxy_list)} proxies...")
+        
+        for proxy_url in proxy_list:
+            try:
+                connector = ProxyConnector.from_url(proxy_url)
+                # Создаем отдельную сессию под каждую прокси
+                session = aiohttp.ClientSession(connector=connector)
+                proxy_sessions.append(session)
+            except Exception as e:
+                print(f"⚠️ Failed to load proxy {proxy_url}: {e}")
+
+        if proxy_sessions:
+            proxy_cycle = itertools.cycle(proxy_sessions)
+            print(f"✅ Loaded {len(proxy_sessions)} proxy sessions. Rotation enabled.")
+        else:
+            print("❌ No valid proxies loaded.")
     else:
-        print("WARNING: PROXY_URL not found, using direct connection.")
-        http_session_proxy = aiohttp.ClientSession()
+        print("ℹ️ No proxies found (direct connection only).")
 
     try:
         await init_db()
-        print("Started")
+        print("🚀 Bot Started")
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:
         print("🛑 Closing sessions...")
-        if http_session_direct: await http_session_direct.close()
-        if http_session_proxy: await http_session_proxy.close()
+        if http_session_direct: 
+            await http_session_direct.close()
+        
+        # Закрываем все прокси-сессии
+        for s in proxy_sessions:
+            if not s.closed:
+                await s.close()
+                
         print("✅ Sessions closed.")
 
 if __name__ == "__main__":
